@@ -203,7 +203,6 @@ void Violation(string reason)
 //+------------------------------------------------------------------+
 string ViolationReason(datetime ny, datetime today)
 {
-   if(AfterFC(ny))     return "POST_FORCE_CLOSE";
    if(g_trade_taken)   return "ONE_SHOT_ALREADY_USED";
    if(!InKillZone(ny)) return "OUTSIDE_KILL_ZONE";
    return "";
@@ -364,20 +363,13 @@ void ForceCloseCheck(datetime ny)
    if(PositionsTotal() > 0)
    {
       if(g_fc_first_attempt == 0)
-         g_fc_first_attempt = TimeCurrent();
-
-      CloseAll("FORCE_CLOSE_16:30");
-
-      // Escalating alert if broker repeatedly rejects the close order
-      int elapsed = (int)(TimeCurrent() - g_fc_first_attempt);
-      if(elapsed > 60)
       {
-         string warn = "FORCE CLOSE FAILING for " + IntegerToString(elapsed)
-                     + "s — MANUAL ACTION REQUIRED";
-         Log("FC_ALERT", warn);
-         if(Enable_Alerts) Alert("[GMG] " + warn);
-         if(Enable_Push)   SendNotification("[GMG] " + warn);
+         g_fc_first_attempt = TimeCurrent();
+         Log("FC_START", TimeToString(ny, TIME_DATE | TIME_MINUTES));
+         if(Enable_Alerts) Alert("[GMG] FORCE CLOSE 16:30 — closing all positions");
+         if(Enable_Push)   SendNotification("[GMG] FORCE CLOSE 16:30 — closing all positions");
       }
+      CloseAll("FORCE_CLOSE_16:30");
    }
    else
    {
@@ -540,6 +532,8 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
 
    datetime ny    = NyTime();
    datetime today = TodayNY();
+
+   if(AfterFC(ny)) { CloseAll("FORCE_CLOSE_16:30"); return; }
 
    string reason = ViolationReason(ny, today);
    if(reason != "")
