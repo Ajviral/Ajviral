@@ -319,24 +319,59 @@ void DetectDisplacement()
    state.displacement_valid = (range > 0.0 && body > ATR_Value * 0.5);
 }
 
+//================ MITIGATION HELPERS =================//
+
+int FindImpulseOrigin(int bar_from, int bar_to)
+{
+   // Returns the shift of the most recent closed M5 candle whose body exceeds ATR * 0.5.
+   // Iterates from most recent (bar_from) toward oldest (bar_to); shift >= 2 guarantees
+   // the result is always a fully closed candle distinct from the evaluation bar (bar 1).
+   for(int i = bar_from; i <= bar_to; i++)
+   {
+      double body  = MathAbs(iClose(_Symbol, PERIOD_M5, i) - iOpen(_Symbol, PERIOD_M5, i));
+      double range = iHigh (_Symbol, PERIOD_M5, i) - iLow(_Symbol, PERIOD_M5, i);
+      if(range > 0.0 && body > ATR_Value * 0.5)
+         return i;
+   }
+   return -1;
+}
+
+//================ MITIGATION =================//
 void DetectMitigation()
 {
-   // Mitigation proxy: last closed M5 bar (bar 1) closes inside the body of bar 2.
-   // Bar 2 is the candidate order block — the candle preceding the displacement move.
-   // If bar 2 is a doji (body < 10% ATR), widen the reference to its full range.
-   double ob_open  = iOpen (_Symbol, PERIOD_M5, 2);
-   double ob_close = iClose(_Symbol, PERIOD_M5, 2);
-   double ob_hi    = MathMax(ob_open, ob_close);
-   double ob_lo    = MathMin(ob_open, ob_close);
+   state.mitigation_valid = false;
 
-   if((ob_hi - ob_lo) < ATR_Value * 0.1)
+   // No mitigation is possible without a prior displacement candle in recent history
+   int origin = FindImpulseOrigin(2, 8);
+   if(origin < 0) return;
+
+   double imp_open  = iOpen (_Symbol, PERIOD_M5, origin);
+   double imp_close = iClose(_Symbol, PERIOD_M5, origin);
+   double imp_range = MathAbs(imp_close - imp_open);
+   if(imp_range <= 0.0) return;
+
+   // Evaluate bar 1 (most recent closed candle) against the displacement body
+   double eval_close  = iClose(_Symbol, PERIOD_M5, 1);
+   double retracement = 0.0;
+
+   if(imp_close > imp_open)   // bullish impulse — mitigation is price retracing back into the body
    {
-      ob_hi = iHigh(_Symbol, PERIOD_M5, 2);
-      ob_lo = iLow (_Symbol, PERIOD_M5, 2);
+      if(eval_close >= imp_open && eval_close < imp_close)
+         retracement = (imp_close - eval_close) / imp_range;
+      else
+         return;
+   }
+   else                       // bearish impulse — mitigation is price bouncing back into the body
+   {
+      if(eval_close > imp_close && eval_close <= imp_open)
+         retracement = (eval_close - imp_close) / imp_range;
+      else
+         return;
    }
 
-   double last_close       = iClose(_Symbol, PERIOD_M5, 1);
-   state.mitigation_valid  = (last_close >= ob_lo && last_close <= ob_hi);
+   // Valid:    20%–50% — price is inside the displacement order block zone
+   // Rejected: >70%   — price has retraced so deeply that structural integrity is broken
+   state.mitigation_valid = (retracement >= 0.20 && retracement <= 0.50);
 }
 
 //================ SMT HELPERS =================//
