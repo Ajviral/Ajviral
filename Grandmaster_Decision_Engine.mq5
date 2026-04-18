@@ -1,5 +1,7 @@
 //+------------------------------------------------------------------+
-//| GRANDMASTER UNIFIED DECISION ENGINE v1.1                         |
+//| ELITE GRANDMASTER DECISION ENGINE v2.0                          |
+//| Institutional ICT/SMT Analysis System for MetaTrader 5          |
+//| All Stage 2-5 upgrades + all 14 Stage-6 audit fixes integrated  |
 //+------------------------------------------------------------------+
 #property indicator_chart_window
 #property indicator_plots 0
@@ -7,7 +9,6 @@
 //================ INPUTS =================//
 input int    Timer_Seconds = 5;
 input int    ATR_Period     = 14;
-
 input string NAS100 = "NAS100";
 input string US30   = "US30";
 input string GOLD   = "XAUUSD";
@@ -20,26 +21,26 @@ enum TRADE_DIRECTION { DIR_NONE, DIR_BUY, DIR_SELL };
 
 //================ SCORE CONSTANTS =================//
 
-// Fat tail raw component weights — sum defines MAX_FAT_RAW
-const double W_FAT_RANGE        = 10.0;
-const double W_FAT_DISP         = 10.0;
-const double W_FAT_QUAL         =  5.0;
-const double W_FAT_TIME         =  5.0;
-const double MAX_FAT_RAW        = 30.0;   // W_FAT_RANGE + W_FAT_DISP + W_FAT_QUAL + W_FAT_TIME
-const double FAT_ACTIVE_THRESH  = 200.0 / 3.0;  // 20/30 * 100 — preserves original 2/3-of-max gate
+// Fat tail raw weights — quality and displacement excluded to prevent compounding
+// through the fat_tail -> total_score path (both are already scored directly).
+// FIX-7 + FIX-8: W_FAT_QUAL and W_FAT_DISP intentionally removed from fat tail.
+const double W_FAT_RANGE       = 10.0;
+const double W_FAT_TIME        =  5.0;
+const double MAX_FAT_RAW       = 15.0;          // W_FAT_RANGE + W_FAT_TIME only
+const double FAT_ACTIVE_THRESH = 200.0 / 3.0;  // ~66.67 — 2/3-of-max gate on 0-100 scale
 
-// Total score component weights — sum defines MAX_TOTAL_RAW
+// Total score component weights
 const double W_TOTAL_SWEEP      = 20.0;
 const double W_TOTAL_DISP       = 20.0;
 const double W_TOTAL_QUAL       = 10.0;
 const double W_TOTAL_TIME       = 10.0;
 const double W_TOTAL_MITIG      = 10.0;
-const double W_TOTAL_SMT        = 15.0;   // max raw SMT contribution (smt_score = 0 or 15)
-const double W_TOTAL_FAT        = 10.0;   // fat_tail ceiling in total (= 1/3 of MAX_FAT_RAW)
-const double MAX_TOTAL_RAW      = 95.0;   // sum of all W_TOTAL_*
-const double TOTAL_TRADE_THRESH = 68.4;   // 65/95 * 100 — mathematically equivalent gate
+const double W_TOTAL_SMT        = 15.0;
+const double W_TOTAL_FAT        = 10.0;
+const double MAX_TOTAL_RAW      = 95.0;
+const double TOTAL_TRADE_THRESH = 68.4;   // 65/95 * 100
 
-// Press score independent weights — must sum to 100.0 with no reference to total_score
+// Press score weights — independent of total_score, sum to 100.0
 const double W_PRESS_FAT        = 30.0;
 const double W_PRESS_SMT        = 25.0;
 const double W_PRESS_QUAL       = 20.0;
@@ -48,14 +49,17 @@ const double W_PRESS_DISP       = 10.0;
 const double PRESS_NO_TRADE_DED = 20.0;
 const double PRESS_2R_THRESH    = 80.0;
 
-// No-trade component weights — raw components already sum to 100; no normalization needed
-const double W_NOTRADE_RANGE    = 25.0;
-const double W_NOTRADE_CHOP     = 20.0;
-const double W_NOTRADE_NODISP   = 15.0;
-const double W_NOTRADE_NOSWEEP  = 15.0;
-const double W_NOTRADE_NOSMT    = 10.0;
-const double W_NOTRADE_WINDOW   = 15.0;
-const double NOTRADE_THRESH     = 60.0;
+// No-trade component weights — components sum to 100
+const double W_NOTRADE_RANGE   = 25.0;
+const double W_NOTRADE_CHOP    = 20.0;
+const double W_NOTRADE_NODISP  = 15.0;
+const double W_NOTRADE_NOSWEEP = 15.0;
+const double W_NOTRADE_NOSMT   = 10.0;
+const double W_NOTRADE_WINDOW  = 15.0;
+const double NOTRADE_THRESH    = 60.0;
+
+// FIX-9: ATR staleness threshold
+const int ATR_STALE_SECONDS = 300;   // 5 minutes
 
 //================ STATE =================//
 struct MasterState
@@ -64,7 +68,7 @@ struct MasterState
    MARKET_QUALITY   quality;
 
    bool             no_trade_day;
-   double           no_trade_score;   // 0–100, components already sum to 100
+   double           no_trade_score;   // 0-100
 
    bool             sweep_detected;
    TRADE_DIRECTION  sweep_direction;
@@ -72,14 +76,14 @@ struct MasterState
    bool             displacement_valid;
    bool             mitigation_valid;
 
-   int              smt_score;        // raw: 0 or 15 (kept int for direct display clarity)
+   int              smt_score;        // raw: 0, 8, or 15
    bool             smt_confirmed;
 
-   double           fat_tail_score;   // normalized 0–100
+   double           fat_tail_score;   // normalized 0-100
    bool             fat_tail_active;
 
-   double           total_score;      // normalized 0–100
-   double           press_score;      // normalized 0–100, independent of total_score
+   double           total_score;      // normalized 0-100
+   double           press_score;      // normalized 0-100, independent of total_score
 
    double           risk_multiplier;
    string           decision;
@@ -89,12 +93,16 @@ struct MasterState
 MasterState state;
 
 //================ GLOBALS =================//
-int    ATR_Handle;
-double ATR_Buffer[];
-double ATR_Value;
+int      ATR_Handle;
+double   ATR_Buffer[];
+double   ATR_Value;
+datetime ATR_LastUpdate;   // FIX-9: staleness guard
 
 double   PDH, PDL;
-datetime last_bar_time;
+datetime last_bar_time;    // FIX-12: tracks M5 bar open time
+
+// FIX-10: impulse origin cache for DetectMitigation
+datetime g_impulse_time = 0;   // absolute time of cached impulse candle
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -106,10 +114,13 @@ int OnInit()
    state.quality         = MIXED;
    state.decision        = "INIT";
 
+   ATR_LastUpdate  = 0;
+   g_impulse_time  = 0;
+
    ATR_Handle = iATR(_Symbol, PERIOD_M5, ATR_Period);
    if(ATR_Handle == INVALID_HANDLE)
    {
-      Alert("GRANDMASTER: ATR handle creation failed. Indicator disabled.");
+      Alert("ELITE GRANDMASTER: ATR handle creation failed. Indicator disabled.");
       return INIT_FAILED;
    }
 
@@ -145,7 +156,9 @@ int OnCalculate(const int rates_total,
 //+------------------------------------------------------------------+
 void OnTimer()
 {
-   if(!IsNewMinute()) return;
+   // FIX-12: evaluate once per M5 bar — prevents timing-score oscillation
+   // across the 5 M1 sub-bars within each M5 bar
+   if(!IsNewM5Bar()) return;
 
    datetime ny = GetNYTime();
 
@@ -172,23 +185,21 @@ void OnTimer()
    RenderDashboard(ny);
 }
 
-//+------------------------------------------------------------------+
-
 //================ UTIL =================//
-bool IsNewMinute()
+
+// FIX-12: gate on M5 bar open time, not M1 minute, for scoring stability
+bool IsNewM5Bar()
 {
-   datetime t = iTime(_Symbol, PERIOD_M1, 0);
+   datetime t = iTime(_Symbol, PERIOD_M5, 0);
    if(t == last_bar_time) return false;
    last_bar_time = t;
    return true;
 }
 
 //================ NY TIME (DST-AWARE) =================//
-//
 // US Eastern:
-//   EDT (UTC-4): 2nd Sunday March  at 02:00 AM EST  = 07:00 UTC
+//   EDT (UTC-4): 2nd Sunday March  at 02:00 AM EST = 07:00 UTC
 //   EST (UTC-5): 1st Sunday November at 02:00 AM EDT = 06:00 UTC
-//
 datetime GetNYTime()
 {
    datetime gmt = TimeGMT();
@@ -202,7 +213,7 @@ datetime GetNYTime()
    mar1.year = year; mar1.mon = 3; mar1.day = 1;
    MqlDateTime mar1_info;
    TimeToStruct(StructToTime(mar1), mar1_info);
-   int dow_mar1       = mar1_info.day_of_week;           // 0 = Sunday
+   int dow_mar1       = mar1_info.day_of_week;
    int first_sun_mar  = (dow_mar1 == 0) ? 1 : 1 + (7 - dow_mar1);
    int second_sun_mar = first_sun_mar + 7;
 
@@ -229,7 +240,6 @@ datetime GetNYTime()
 }
 
 //================ NORMALIZATION =================//
-
 double NormalizeFatTail(double raw)
 {
    return MathMin(MathMax(raw / MAX_FAT_RAW * 100.0, 0.0), 100.0);
@@ -245,12 +255,36 @@ double ClampScore(double score)
    return MathMin(MathMax(score, 0.0), 100.0);
 }
 
+//================ TIMING WEIGHT =================//
+// FIX-6: smooth decay replaces the hard 9:45 timing cliff.
+// Returns 0.0-1.0 quality factor for the NY kill zone window.
+// Peak 1.0 during 9:30-9:40; linear decay to 0.0 by 9:55; zero outside.
+double TimingWeight(datetime ny)
+{
+   MqlDateTime t; TimeToStruct(ny, t);
+   if(t.hour != 9) return 0.0;
+   int m = t.min;
+   if(m < 30 || m > 55) return 0.0;
+   if(m <= 40) return 1.0;
+   return 1.0 - (double)(m - 40) / 15.0;   // linear decay from 9:40 to 9:55
+}
+
 //================ ATR =================//
+// FIX-9: staleness guard — zero ATR_Value if no fresh read within threshold
 void UpdateATR()
 {
    if(ATR_Handle == INVALID_HANDLE) return;
+
+   datetime now = TimeCurrent();
    if(CopyBuffer(ATR_Handle, 0, 0, 1, ATR_Buffer) > 0 && ATR_Buffer[0] > 0.0)
-      ATR_Value = ATR_Buffer[0];
+   {
+      ATR_Value      = ATR_Buffer[0];
+      ATR_LastUpdate = now;
+   }
+   else if(ATR_LastUpdate > 0 && (now - ATR_LastUpdate) > ATR_STALE_SECONDS)
+   {
+      ATR_Value = 0.0;   // stale — blocks all downstream scoring
+   }
 }
 
 //================ MARKET =================//
@@ -258,7 +292,7 @@ void UpdateMarketPhase(datetime ny)
 {
    MqlDateTime t; TimeToStruct(ny, t);
 
-   if(t.hour < 7)        state.phase = ACCUMULATION;
+   if     (t.hour < 7)   state.phase = ACCUMULATION;
    else if(t.hour < 9)   state.phase = MANIPULATION;
    else if(t.hour <= 11) state.phase = EXPANSION;
    else                  state.phase = UNKNOWN;
@@ -266,7 +300,7 @@ void UpdateMarketPhase(datetime ny)
 
 void UpdateMarketQuality()
 {
-   // Closed M5 bars only — bars 1-6 vs 2-7
+   // Closed M5 bars only — overlap ratio of consecutive bars 1-6
    int overlap = 0;
    for(int i = 1; i <= 5; i++)
    {
@@ -277,7 +311,7 @@ void UpdateMarketQuality()
       if(l < ph && h > pl) overlap++;
    }
    double ratio = overlap / 5.0;
-   if(ratio < 0.3)      state.quality = CLEAN;
+   if     (ratio < 0.3) state.quality = CLEAN;
    else if(ratio < 0.7) state.quality = MIXED;
    else                 state.quality = CHOP;
 }
@@ -291,7 +325,7 @@ void UpdateDailyLevels()
 
 void DetectSweep()
 {
-   // Use last CLOSED M5 bar (shift = 1) — never the forming bar
+   // Closed M5 bar (shift=1) only — never the forming bar
    double high  = iHigh (_Symbol, PERIOD_M5, 1);
    double low   = iLow  (_Symbol, PERIOD_M5, 1);
    double close = iClose(_Symbol, PERIOD_M5, 1);
@@ -302,12 +336,12 @@ void DetectSweep()
    if(high > PDH && close < PDH)
    {
       state.sweep_detected  = true;
-      state.sweep_direction = DIR_SELL;  // liquidity grab above PDH → expect reversal down
+      state.sweep_direction = DIR_SELL;   // grab above PDH -> expect reversal down
    }
    else if(low < PDL && close > PDL)
    {
       state.sweep_detected  = true;
-      state.sweep_direction = DIR_BUY;   // liquidity grab below PDL → expect reversal up
+      state.sweep_direction = DIR_BUY;    // grab below PDL -> expect reversal up
    }
 }
 
@@ -321,11 +355,10 @@ void DetectDisplacement()
 
 //================ MITIGATION HELPERS =================//
 
+// Returns shift of the most recent M5 impulse candle (body > ATR*0.5) within [bar_from, bar_to].
+// Minimum shift=2 guarantees origin is always older than the evaluation bar (shift=1).
 int FindImpulseOrigin(int bar_from, int bar_to)
 {
-   // Returns the shift of the most recent closed M5 candle whose body exceeds ATR * 0.5.
-   // Iterates from most recent (bar_from) toward oldest (bar_to); shift >= 2 guarantees
-   // the result is always a fully closed candle distinct from the evaluation bar (bar 1).
    for(int i = bar_from; i <= bar_to; i++)
    {
       double body  = MathAbs(iClose(_Symbol, PERIOD_M5, i) - iOpen(_Symbol, PERIOD_M5, i));
@@ -341,27 +374,51 @@ void DetectMitigation()
 {
    state.mitigation_valid = false;
 
-   // No mitigation is possible without a prior displacement candle in recent history
-   int origin = FindImpulseOrigin(2, 8);
-   if(origin < 0) return;
+   // No sweep context — clear cache and exit
+   if(!state.sweep_detected)
+   {
+      g_impulse_time = 0;
+      return;
+   }
+
+   // FIX-10: reuse cached origin if its bar is still within the lookback window
+   int origin = -1;
+   if(g_impulse_time > 0)
+   {
+      for(int i = 2; i <= 8; i++)
+         if(iTime(_Symbol, PERIOD_M5, i) == g_impulse_time) { origin = i; break; }
+   }
+
+   // Cache miss or aged out — fresh scan, then cache the result
+   if(origin < 0)
+   {
+      origin = FindImpulseOrigin(2, 8);
+      if(origin < 0) return;
+      g_impulse_time = iTime(_Symbol, PERIOD_M5, origin);
+   }
 
    double imp_open  = iOpen (_Symbol, PERIOD_M5, origin);
    double imp_close = iClose(_Symbol, PERIOD_M5, origin);
    double imp_range = MathAbs(imp_close - imp_open);
    if(imp_range <= 0.0) return;
 
-   // Evaluate bar 1 (most recent closed candle) against the displacement body
+   // FIX-2: impulse direction must align with sweep direction
+   bool bullish_impulse = (imp_close > imp_open);
+   if(state.sweep_direction == DIR_BUY  && !bullish_impulse) return;
+   if(state.sweep_direction == DIR_SELL &&  bullish_impulse) return;
+
+   // Evaluate bar 1 (most recent closed candle) retracement into impulse body
    double eval_close  = iClose(_Symbol, PERIOD_M5, 1);
    double retracement = 0.0;
 
-   if(imp_close > imp_open)   // bullish impulse — mitigation is price retracing back into the body
+   if(bullish_impulse)
    {
       if(eval_close >= imp_open && eval_close < imp_close)
          retracement = (imp_close - eval_close) / imp_range;
       else
          return;
    }
-   else                       // bearish impulse — mitigation is price bouncing back into the body
+   else
    {
       if(eval_close > imp_close && eval_close <= imp_open)
          retracement = (eval_close - imp_close) / imp_range;
@@ -369,13 +426,12 @@ void DetectMitigation()
          return;
    }
 
-   // Valid:    20%–50% — price is inside the displacement order block zone
-   // Rejected: >70%   — price has retraced so deeply that structural integrity is broken
+   // 20%-50%: valid order block retracement
+   // >70%: structural failure (implicitly rejected by upper bound)
    state.mitigation_valid = (retracement >= 0.20 && retracement <= 0.50);
 }
 
 //================ SMT HELPERS =================//
-
 bool SMTLoadSymbol(string sym)
 {
    if(!SymbolSelect(sym, true)) return false;
@@ -445,53 +501,49 @@ void UpdateSMT()
    if(target == "") return;
    if(!SMTLoadSymbol(target)) return;
 
-   // Detection window : bars 1–3 (closed candles, timing alignment zone)
-   // Reference window : bars 4–6 (structural anchor for divergence comparison)
-   const int W1 = 1, W2 = 3;
-   const int R1 = 4, R2 = 6;
+   // Target detection window : bars 1-3 (full divergence picture)
+   // Self detection window   : bars 2-3 (FIX-5: bar 1 excluded — sweep bar corrupts self structure)
+   // Reference window        : bars 4-6 (structural anchor for both assets)
+   const int W1  = 1, W2  = 3;   // target
+   const int SW1 = 2, SW2 = 3;   // self (sweep-bar-safe)
+   const int R1  = 4, R2  = 6;   // reference
 
-   double tgt_w_low   = SMTSwingLow (target,   W1, W2);
-   double tgt_w_high  = SMTSwingHigh(target,   W1, W2);
-   double tgt_r_low   = SMTSwingLow (target,   R1, R2);
-   double tgt_r_high  = SMTSwingHigh(target,   R1, R2);
+   double tgt_w_low   = SMTSwingLow (target,  W1,  W2);
+   double tgt_w_high  = SMTSwingHigh(target,  W1,  W2);
+   double tgt_r_low   = SMTSwingLow (target,  R1,  R2);
+   double tgt_r_high  = SMTSwingHigh(target,  R1,  R2);
 
-   double self_w_low  = SMTSwingLow (_Symbol,  W1, W2);
-   double self_w_high = SMTSwingHigh(_Symbol,  W1, W2);
-   double self_r_low  = SMTSwingLow (_Symbol,  R1, R2);
-   double self_r_high = SMTSwingHigh(_Symbol,  R1, R2);
+   double self_w_low  = SMTSwingLow (_Symbol, SW1, SW2);
+   double self_w_high = SMTSwingHigh(_Symbol, SW1, SW2);
+   double self_r_low  = SMTSwingLow (_Symbol, R1,  R2);
+   double self_r_high = SMTSwingHigh(_Symbol, R1,  R2);
 
-   // Reject on any zero/missing level — prevents false signals from incomplete data
+   // Reject if any level is zero — incomplete data protection
    if(tgt_w_low  <= 0.0 || tgt_w_high  <= 0.0 ||
       tgt_r_low  <= 0.0 || tgt_r_high  <= 0.0 ||
-      self_w_low <= 0.0 || self_w_high  <= 0.0 ||
-      self_r_low <= 0.0 || self_r_high  <= 0.0) return;
+      self_w_low <= 0.0 || self_w_high <= 0.0  ||
+      self_r_low <= 0.0 || self_r_high <= 0.0) return;
 
-   int tgt_low_bar   = SMTSwingLowBar (target,   W1, W2);
-   int tgt_high_bar  = SMTSwingHighBar(target,   W1, W2);
-   int self_low_bar  = SMTSwingLowBar (_Symbol,  W1, W2);
-   int self_high_bar = SMTSwingHighBar(_Symbol,  W1, W2);
+   int tgt_low_bar   = SMTSwingLowBar (target,  W1,  W2);
+   int tgt_high_bar  = SMTSwingHighBar(target,  W1,  W2);
+   int self_low_bar  = SMTSwingLowBar (_Symbol, SW1, SW2);
+   int self_high_bar = SMTSwingHighBar(_Symbol, SW1, SW2);
 
    int score = 0;
 
    if(!inverse)
    {
-      // Correlated pair — both assets are expected to make equivalent swings
-      //
-      // Bullish structural divergence:
-      //   target broke below its reference low; self held above its reference low
+      // Correlated pair: both assets expected to make equivalent swings
       bool tgt_broke_low  = (tgt_w_low  < tgt_r_low);
       bool self_held_low  = (self_w_low >= self_r_low);
-
-      // Bearish structural divergence:
-      //   target broke above its reference high; self failed to follow
       bool tgt_broke_high = (tgt_w_high > tgt_r_high);
       bool self_held_high = (self_w_high <= self_r_high);
 
       if(tgt_broke_low && self_held_low)
       {
          int td = MathAbs(tgt_low_bar - self_low_bar);
-         if     (td <= 1) score = 15;   // same or adjacent bar → Strong
-         else if(td <= 2) score = 8;    // 2-bar gap → Moderate
+         if     (td <= 1) score = 15;   // Strong
+         else if(td <= 2) score = 8;    // Moderate
       }
       else if(tgt_broke_high && self_held_high)
       {
@@ -502,15 +554,9 @@ void UpdateSMT()
    }
    else
    {
-      // Inverse pair (e.g. GOLD / DXY) — assets expected to move in opposite directions
-      //
-      // Bullish self SMT:
-      //   target (DXY) broke above its reference high; self (GOLD) failed to break its reference low
+      // Inverse pair (e.g. GOLD / DXY): assets expected to move in opposite directions
       bool tgt_broke_high = (tgt_w_high > tgt_r_high);
       bool self_held_low  = (self_w_low >= self_r_low);
-
-      // Bearish self SMT:
-      //   target (DXY) broke below its reference low; self (GOLD) failed to break its reference high
       bool tgt_broke_low  = (tgt_w_low  < tgt_r_low);
       bool self_held_high = (self_w_high <= self_r_high);
 
@@ -529,7 +575,7 @@ void UpdateSMT()
    }
 
    state.smt_score     = score;
-   state.smt_confirmed = (score >= 10);
+   state.smt_confirmed = (score >= 8);   // FIX-4: confirms on Moderate (8) and Strong (15)
 }
 
 //================ FAT TAIL =================//
@@ -538,15 +584,16 @@ void UpdateFatTailState(datetime ny)
    double raw   = 0.0;
    double range = iHigh(_Symbol, PERIOD_M5, 1) - iLow(_Symbol, PERIOD_M5, 1);
 
-   if(range > ATR_Value)        raw += W_FAT_RANGE;
-   if(state.displacement_valid) raw += W_FAT_DISP;
-   if(state.quality == CLEAN)   raw += W_FAT_QUAL;
+   if(range > ATR_Value) raw += W_FAT_RANGE;
 
-   MqlDateTime t; TimeToStruct(ny, t);
-   if(t.hour == 9 && t.min <= 40) raw += W_FAT_TIME;
+   // FIX-6: smooth timing contribution — no hard cliff at 9:45
+   raw += TimingWeight(ny) * W_FAT_TIME;
 
-   state.fat_tail_score  = NormalizeFatTail(raw);            // 0–100
-   state.fat_tail_active = (state.fat_tail_score >= FAT_ACTIVE_THRESH);  // same 2/3-of-max gate
+   // FIX-7+8: quality and displacement excluded — already scored directly in
+   // total_score and press_score; including here creates compounding reward path
+
+   state.fat_tail_score  = NormalizeFatTail(raw);
+   state.fat_tail_active = (state.fat_tail_score >= FAT_ACTIVE_THRESH);
 }
 
 //================ NO TRADE =================//
@@ -555,16 +602,16 @@ void UpdateNoTradeState(datetime ny)
    double score = 0.0;
    double range = iHigh(_Symbol, PERIOD_M5, 1) - iLow(_Symbol, PERIOD_M5, 1);
 
-   if(range < ATR_Value * 0.5)    score += W_NOTRADE_RANGE;
-   if(state.quality == CHOP)      score += W_NOTRADE_CHOP;
-   if(!state.displacement_valid)  score += W_NOTRADE_NODISP;
-   if(!state.sweep_detected)      score += W_NOTRADE_NOSWEEP;
-   if(!state.smt_confirmed)       score += W_NOTRADE_NOSMT;
+   if(range < ATR_Value * 0.5)   score += W_NOTRADE_RANGE;
+   if(state.quality == CHOP)     score += W_NOTRADE_CHOP;
+   if(!state.displacement_valid) score += W_NOTRADE_NODISP;
+   if(!state.sweep_detected)     score += W_NOTRADE_NOSWEEP;
+   if(!state.smt_confirmed)      score += W_NOTRADE_NOSMT;
 
-   MqlDateTime t; TimeToStruct(ny, t);
-   if(!(t.hour == 9 && t.min >= 30 && t.min <= 45)) score += W_NOTRADE_WINDOW;
+   // FIX-6: smooth timing penalty — zero at peak window, full at dead zones
+   score += (1.0 - TimingWeight(ny)) * W_NOTRADE_WINDOW;
 
-   state.no_trade_score = score;                      // 0–100, components sum to exactly 100
+   state.no_trade_score = score;
    state.no_trade_day   = (score >= NOTRADE_THRESH);
 }
 
@@ -573,43 +620,38 @@ void CalculateScore(datetime ny)
 {
    double raw = 0.0;
 
-   if(state.sweep_detected)      raw += W_TOTAL_SWEEP;
-   if(state.displacement_valid)  raw += W_TOTAL_DISP;
-   if(state.quality == CLEAN)    raw += W_TOTAL_QUAL;
+   if(state.sweep_detected)     raw += W_TOTAL_SWEEP;
+   if(state.displacement_valid) raw += W_TOTAL_DISP;
+   if(state.quality == CLEAN)   raw += W_TOTAL_QUAL;
 
-   MqlDateTime t; TimeToStruct(ny, t);
-   if(t.hour == 9 && t.min >= 30 && t.min <= 45) raw += W_TOTAL_TIME;
+   // FIX-6: smooth timing bonus scales with window quality
+   raw += TimingWeight(ny) * W_TOTAL_TIME;
 
-   if(state.mitigation_valid)    raw += W_TOTAL_MITIG;
+   if(state.mitigation_valid)   raw += W_TOTAL_MITIG;
 
-   // SMT: exact fractional contribution — no integer truncation
-   raw += (state.smt_score / 15.0) * W_TOTAL_SMT;
-
-   // Fat tail: passes through its normalized 0–100 value scaled to its weight ceiling
-   // Eliminates the integer division truncation of the former fat_tail_score / 3
+   raw += (state.smt_score / 15.0)       * W_TOTAL_SMT;
    raw += (state.fat_tail_score / 100.0) * W_TOTAL_FAT;
 
-   state.total_score = NormalizeTotal(raw);           // 0–100
+   state.total_score = NormalizeTotal(raw);
 }
 
 //================ PRESS =================//
 void CalculatePressScore(datetime ny)
 {
-   // Computed entirely from raw components — zero dependency on total_score.
-   // W_PRESS_* weights sum to 100.0, making the score range [0, 100] before deduction.
+   // Computed entirely from raw sub-components — zero dependency on total_score
    double score = 0.0;
 
-   score += (state.fat_tail_score / 100.0) * W_PRESS_FAT;  // 0.0 – 30.0
-   score += (state.smt_score / 15.0)       * W_PRESS_SMT;  // 0.0 – 25.0
-   if(state.quality == CLEAN)    score += W_PRESS_QUAL;     // 0.0 or 20.0
-   if(state.sweep_detected)      score += W_PRESS_SWEEP;    // 0.0 or 15.0
-   if(state.displacement_valid)  score += W_PRESS_DISP;     // 0.0 or 10.0
+   score += (state.fat_tail_score / 100.0) * W_PRESS_FAT;   // 0.0 - 30.0
+   score += (state.smt_score / 15.0)       * W_PRESS_SMT;   // 0.0 - 25.0
+   if(state.quality == CLEAN)    score += W_PRESS_QUAL;      // 0.0 or 20.0
+   if(state.sweep_detected)      score += W_PRESS_SWEEP;     // 0.0 or 15.0
+   if(state.displacement_valid)  score += W_PRESS_DISP;      // 0.0 or 10.0
    // raw max = 100.0
 
    if(state.no_trade_day) score -= PRESS_NO_TRADE_DED;
 
-   state.press_score = ClampScore(score);                   // 0–100
-   // risk_multiplier is assigned exclusively in FinalDecision
+   state.press_score = ClampScore(score);
+   // risk_multiplier assigned exclusively in FinalDecision
 }
 
 //================ FINAL DECISION =================//
@@ -619,9 +661,18 @@ void FinalDecision()
    state.direction       = DIR_NONE;
    state.risk_multiplier = 0.0;
 
+   // FIX-11: zero press when blocked — prevents misleading high press display
    if(state.no_trade_day)
    {
-      state.decision = "BLOCKED";
+      state.decision    = "BLOCKED";
+      state.press_score = 0.0;
+      return;
+   }
+
+   // FIX-1: phase gate — only EXPANSION permits trade execution
+   if(state.phase != EXPANSION)
+   {
+      state.decision = "WAIT EXPANSION";
       return;
    }
 
@@ -634,21 +685,24 @@ void FinalDecision()
       return;
    }
 
-   // Direction derived from sweep type — single source of truth
+   // Direction is derived exclusively from sweep type — single source of truth
    state.direction = state.sweep_direction;
 
-   // Single authoritative risk assignment — not set anywhere else
-   if     (state.press_score >= 80.0) state.risk_multiplier = 2.0;
-   else if(state.press_score >= 65.0) state.risk_multiplier = 1.5;
+   // FIX-3: non-PRESS-2R risk capped at 1.5x — 2.0x reserved for PRESS 2R only
+   if     (state.press_score >= 80.0) state.risk_multiplier = 1.5;
+   else if(state.press_score >= 65.0) state.risk_multiplier = 1.25;
    else if(state.press_score >= 50.0) state.risk_multiplier = 1.0;
    else                               state.risk_multiplier = 0.5;
 
    state.decision = "TRADE";
 
-   if(state.press_score >= PRESS_2R_THRESH &&
-      state.fat_tail_active                &&
-      state.smt_confirmed                  &&
-      state.quality == CLEAN)
+   // FIX-13: mitigation_valid added as PRESS 2R prerequisite — ensures
+   // institutional entry precision before maximum size deployment
+   if(state.press_score    >= PRESS_2R_THRESH &&
+      state.fat_tail_active                   &&
+      state.smt_confirmed                     &&
+      state.quality         == CLEAN          &&
+      state.mitigation_valid)
    {
       state.decision        = "PRESS 2R";
       state.risk_multiplier = 2.0;
@@ -666,21 +720,41 @@ void RenderDashboard(datetime ny)
       default:       dir_str = "NONE"; break;
    }
 
-   string txt = "===== GRANDMASTER ENGINE =====\n";
-   txt += "TIME: "       + TimeToString(ny, TIME_MINUTES) + "\n";
-   txt += "\nPHASE: "    + EnumToString(state.phase);
-   txt += "\nQUALITY: "  + EnumToString(state.quality);
-   txt += "\n\nSWEEP: "  + (string)state.sweep_detected;
-   txt += "\nDISP: "     + (string)state.displacement_valid;
-   txt += "\nMITIG: "    + (string)state.mitigation_valid;
-   txt += "\n\nSMT: "    + IntegerToString(state.smt_score);
-   txt += "\nFAT: "      + DoubleToString(state.fat_tail_score, 1);
-   txt += "\n\nTOTAL: "   + DoubleToString(state.total_score,    1);
-   txt += "\nNO TRADE: " + DoubleToString(state.no_trade_score,  1);
-   txt += "\nPRESS: "    + DoubleToString(state.press_score,     1);
-   txt += "\n\nDECISION: "  + state.decision;
-   txt += "\nDIRECTION: "   + dir_str;
-   txt += "\nRISK: "        + DoubleToString(state.risk_multiplier, 1);
+   // FIX-14: display prime window status alongside phase
+   double tw = TimingWeight(ny);
+   string window_str = (tw >= 0.99) ? "PRIME  [9:30-9:40]" :
+                       (tw >= 0.50) ? "ACTIVE [9:40-9:47]" :
+                       (tw >  0.0)  ? "DECAY  [9:47-9:55]" :
+                                      "CLOSED";
+
+   string sweep_detail = "";
+   if(state.sweep_detected)
+      sweep_detail = "  DIR: " + (state.sweep_direction == DIR_BUY ? "BUY" : "SELL");
+
+   string txt = "====== ELITE GRANDMASTER ENGINE v2.0 ======\n";
+   txt += "TIME:      " + TimeToString(ny, TIME_MINUTES) + "\n";
+   txt += "\nPHASE:     " + EnumToString(state.phase);
+   txt += "\nWINDOW:    " + window_str;
+   txt += "\nQUALITY:   " + EnumToString(state.quality);
+   txt += "\n";
+   txt += "\nSWEEP:     " + (string)state.sweep_detected + sweep_detail;
+   txt += "\nDISP:      " + (string)state.displacement_valid;
+   txt += "\nMITIG:     " + (string)state.mitigation_valid;
+   txt += "\n";
+   txt += "\nSMT:       " + IntegerToString(state.smt_score)
+        + "  [" + (state.smt_confirmed ? "CONFIRMED" : "WEAK") + "]";
+   txt += "\nFAT TAIL:  " + DoubleToString(state.fat_tail_score, 1)
+        + "  [" + (state.fat_tail_active ? "ACTIVE" : "IDLE") + "]";
+   txt += "\n";
+   txt += "\nTOTAL:     " + DoubleToString(state.total_score,    1)
+        + " / " + DoubleToString(TOTAL_TRADE_THRESH, 1);
+   txt += "\nNO TRADE:  " + DoubleToString(state.no_trade_score, 1)
+        + " / " + DoubleToString(NOTRADE_THRESH,      1);
+   txt += "\nPRESS:     " + DoubleToString(state.press_score,    1);
+   txt += "\n";
+   txt += "\nDECISION:  " + state.decision;
+   txt += "\nDIRECTION: " + dir_str;
+   txt += "\nRISK:      " + DoubleToString(state.risk_multiplier, 2) + "R";
 
    Comment(txt);
 }
