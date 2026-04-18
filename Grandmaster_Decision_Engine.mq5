@@ -339,6 +339,61 @@ void DetectMitigation()
    state.mitigation_valid  = (last_close >= ob_lo && last_close <= ob_hi);
 }
 
+//================ SMT HELPERS =================//
+
+bool SMTLoadSymbol(string sym)
+{
+   if(!SymbolSelect(sym, true)) return false;
+   if(iBars(sym, PERIOD_M5) < 8) return false;
+   return true;
+}
+
+double SMTSwingLow(string sym, int bar_from, int bar_to)
+{
+   double lo = DBL_MAX;
+   for(int i = bar_from; i <= bar_to; i++)
+   {
+      double v = iLow(sym, PERIOD_M5, i);
+      if(v > 0.0 && v < lo) lo = v;
+   }
+   return (lo == DBL_MAX) ? 0.0 : lo;
+}
+
+double SMTSwingHigh(string sym, int bar_from, int bar_to)
+{
+   double hi = 0.0;
+   for(int i = bar_from; i <= bar_to; i++)
+   {
+      double v = iHigh(sym, PERIOD_M5, i);
+      if(v > hi) hi = v;
+   }
+   return hi;
+}
+
+int SMTSwingLowBar(string sym, int bar_from, int bar_to)
+{
+   double lo  = DBL_MAX;
+   int    idx = bar_from;
+   for(int i = bar_from; i <= bar_to; i++)
+   {
+      double v = iLow(sym, PERIOD_M5, i);
+      if(v > 0.0 && v < lo) { lo = v; idx = i; }
+   }
+   return idx;
+}
+
+int SMTSwingHighBar(string sym, int bar_from, int bar_to)
+{
+   double hi  = 0.0;
+   int    idx = bar_from;
+   for(int i = bar_from; i <= bar_to; i++)
+   {
+      double v = iHigh(sym, PERIOD_M5, i);
+      if(v > hi) { hi = v; idx = i; }
+   }
+   return idx;
+}
+
 //================ SMT =================//
 void UpdateSMT()
 {
@@ -353,26 +408,93 @@ void UpdateSMT()
    else if(_Symbol == GOLD) { target = DXY; inverse = true; }
 
    if(target == "") return;
-   if(!SymbolSelect(target, true)) return;
+   if(!SMTLoadSymbol(target)) return;
 
-   double t_low  = iLow (target, PERIOD_D1, 1);
-   double t_high = iHigh(target, PERIOD_D1, 1);
-   double my_low = iLow (_Symbol, PERIOD_M5, 1);
+   // Detection window : bars 1–3 (closed candles, timing alignment zone)
+   // Reference window : bars 4–6 (structural anchor for divergence comparison)
+   const int W1 = 1, W2 = 3;
+   const int R1 = 4, R2 = 6;
 
-   if(inverse)
+   double tgt_w_low   = SMTSwingLow (target,   W1, W2);
+   double tgt_w_high  = SMTSwingHigh(target,   W1, W2);
+   double tgt_r_low   = SMTSwingLow (target,   R1, R2);
+   double tgt_r_high  = SMTSwingHigh(target,   R1, R2);
+
+   double self_w_low  = SMTSwingLow (_Symbol,  W1, W2);
+   double self_w_high = SMTSwingHigh(_Symbol,  W1, W2);
+   double self_r_low  = SMTSwingLow (_Symbol,  R1, R2);
+   double self_r_high = SMTSwingHigh(_Symbol,  R1, R2);
+
+   // Reject on any zero/missing level — prevents false signals from incomplete data
+   if(tgt_w_low  <= 0.0 || tgt_w_high  <= 0.0 ||
+      tgt_r_low  <= 0.0 || tgt_r_high  <= 0.0 ||
+      self_w_low <= 0.0 || self_w_high  <= 0.0 ||
+      self_r_low <= 0.0 || self_r_high  <= 0.0) return;
+
+   int tgt_low_bar   = SMTSwingLowBar (target,   W1, W2);
+   int tgt_high_bar  = SMTSwingHighBar(target,   W1, W2);
+   int self_low_bar  = SMTSwingLowBar (_Symbol,  W1, W2);
+   int self_high_bar = SMTSwingHighBar(_Symbol,  W1, W2);
+
+   int score = 0;
+
+   if(!inverse)
    {
-      // DXY breaking above yesterday's high while GOLD hasn't broken its low → divergence
-      if(iHigh(target, PERIOD_M5, 1) > t_high && my_low > PDL)
-         state.smt_score = 15;
+      // Correlated pair — both assets are expected to make equivalent swings
+      //
+      // Bullish structural divergence:
+      //   target broke below its reference low; self held above its reference low
+      bool tgt_broke_low  = (tgt_w_low  < tgt_r_low);
+      bool self_held_low  = (self_w_low >= self_r_low);
+
+      // Bearish structural divergence:
+      //   target broke above its reference high; self failed to follow
+      bool tgt_broke_high = (tgt_w_high > tgt_r_high);
+      bool self_held_high = (self_w_high <= self_r_high);
+
+      if(tgt_broke_low && self_held_low)
+      {
+         int td = MathAbs(tgt_low_bar - self_low_bar);
+         if     (td <= 1) score = 15;   // same or adjacent bar → Strong
+         else if(td <= 2) score = 8;    // 2-bar gap → Moderate
+      }
+      else if(tgt_broke_high && self_held_high)
+      {
+         int td = MathAbs(tgt_high_bar - self_high_bar);
+         if     (td <= 1) score = 15;
+         else if(td <= 2) score = 8;
+      }
    }
    else
    {
-      // Correlated index making a new low below yesterday's low while current symbol holds → SMT
-      if(iLow(target, PERIOD_M5, 1) < t_low && my_low > PDL)
-         state.smt_score = 15;
+      // Inverse pair (e.g. GOLD / DXY) — assets expected to move in opposite directions
+      //
+      // Bullish self SMT:
+      //   target (DXY) broke above its reference high; self (GOLD) failed to break its reference low
+      bool tgt_broke_high = (tgt_w_high > tgt_r_high);
+      bool self_held_low  = (self_w_low >= self_r_low);
+
+      // Bearish self SMT:
+      //   target (DXY) broke below its reference low; self (GOLD) failed to break its reference high
+      bool tgt_broke_low  = (tgt_w_low  < tgt_r_low);
+      bool self_held_high = (self_w_high <= self_r_high);
+
+      if(tgt_broke_high && self_held_low)
+      {
+         int td = MathAbs(tgt_high_bar - self_low_bar);
+         if     (td <= 1) score = 15;
+         else if(td <= 2) score = 8;
+      }
+      else if(tgt_broke_low && self_held_high)
+      {
+         int td = MathAbs(tgt_low_bar - self_high_bar);
+         if     (td <= 1) score = 15;
+         else if(td <= 2) score = 8;
+      }
    }
 
-   state.smt_confirmed = (state.smt_score >= 10);
+   state.smt_score     = score;
+   state.smt_confirmed = (score >= 10);
 }
 
 //================ FAT TAIL =================//
