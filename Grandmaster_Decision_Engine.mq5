@@ -18,6 +18,45 @@ enum MARKET_PHASE    { ACCUMULATION, MANIPULATION, EXPANSION, UNKNOWN };
 enum MARKET_QUALITY  { CLEAN, MIXED, CHOP };
 enum TRADE_DIRECTION { DIR_NONE, DIR_BUY, DIR_SELL };
 
+//================ SCORE CONSTANTS =================//
+
+// Fat tail raw component weights — sum defines MAX_FAT_RAW
+const double W_FAT_RANGE        = 10.0;
+const double W_FAT_DISP         = 10.0;
+const double W_FAT_QUAL         =  5.0;
+const double W_FAT_TIME         =  5.0;
+const double MAX_FAT_RAW        = 30.0;   // W_FAT_RANGE + W_FAT_DISP + W_FAT_QUAL + W_FAT_TIME
+const double FAT_ACTIVE_THRESH  = 200.0 / 3.0;  // 20/30 * 100 — preserves original 2/3-of-max gate
+
+// Total score component weights — sum defines MAX_TOTAL_RAW
+const double W_TOTAL_SWEEP      = 20.0;
+const double W_TOTAL_DISP       = 20.0;
+const double W_TOTAL_QUAL       = 10.0;
+const double W_TOTAL_TIME       = 10.0;
+const double W_TOTAL_MITIG      = 10.0;
+const double W_TOTAL_SMT        = 15.0;   // max raw SMT contribution (smt_score = 0 or 15)
+const double W_TOTAL_FAT        = 10.0;   // fat_tail ceiling in total (= 1/3 of MAX_FAT_RAW)
+const double MAX_TOTAL_RAW      = 95.0;   // sum of all W_TOTAL_*
+const double TOTAL_TRADE_THRESH = 68.4;   // 65/95 * 100 — mathematically equivalent gate
+
+// Press score independent weights — must sum to 100.0 with no reference to total_score
+const double W_PRESS_FAT        = 30.0;
+const double W_PRESS_SMT        = 25.0;
+const double W_PRESS_QUAL       = 20.0;
+const double W_PRESS_SWEEP      = 15.0;
+const double W_PRESS_DISP       = 10.0;
+const double PRESS_NO_TRADE_DED = 20.0;
+const double PRESS_2R_THRESH    = 80.0;
+
+// No-trade component weights — raw components already sum to 100; no normalization needed
+const double W_NOTRADE_RANGE    = 25.0;
+const double W_NOTRADE_CHOP     = 20.0;
+const double W_NOTRADE_NODISP   = 15.0;
+const double W_NOTRADE_NOSWEEP  = 15.0;
+const double W_NOTRADE_NOSMT    = 10.0;
+const double W_NOTRADE_WINDOW   = 15.0;
+const double NOTRADE_THRESH     = 60.0;
+
 //================ STATE =================//
 struct MasterState
 {
@@ -25,7 +64,7 @@ struct MasterState
    MARKET_QUALITY   quality;
 
    bool             no_trade_day;
-   int              no_trade_score;
+   double           no_trade_score;   // 0–100, components already sum to 100
 
    bool             sweep_detected;
    TRADE_DIRECTION  sweep_direction;
@@ -33,14 +72,14 @@ struct MasterState
    bool             displacement_valid;
    bool             mitigation_valid;
 
-   int              smt_score;
+   int              smt_score;        // raw: 0 or 15 (kept int for direct display clarity)
    bool             smt_confirmed;
 
-   int              fat_tail_score;
+   double           fat_tail_score;   // normalized 0–100
    bool             fat_tail_active;
 
-   int              total_score;
-   int              press_score;
+   double           total_score;      // normalized 0–100
+   double           press_score;      // normalized 0–100, independent of total_score
 
    double           risk_multiplier;
    string           decision;
@@ -189,6 +228,23 @@ datetime GetNYTime()
    return gmt + offset_hours * 3600;
 }
 
+//================ NORMALIZATION =================//
+
+double NormalizeFatTail(double raw)
+{
+   return MathMin(MathMax(raw / MAX_FAT_RAW * 100.0, 0.0), 100.0);
+}
+
+double NormalizeTotal(double raw)
+{
+   return MathMin(MathMax(raw / MAX_TOTAL_RAW * 100.0, 0.0), 100.0);
+}
+
+double ClampScore(double score)
+{
+   return MathMin(MathMax(score, 0.0), 100.0);
+}
+
 //================ ATR =================//
 void UpdateATR()
 {
@@ -322,76 +378,80 @@ void UpdateSMT()
 //================ FAT TAIL =================//
 void UpdateFatTailState(datetime ny)
 {
-   int score = 0;
-
-   // Closed M5 bar range
+   double raw   = 0.0;
    double range = iHigh(_Symbol, PERIOD_M5, 1) - iLow(_Symbol, PERIOD_M5, 1);
 
-   if(range > ATR_Value)        score += 10;
-   if(state.displacement_valid) score += 10;
-   if(state.quality == CLEAN)   score += 5;
+   if(range > ATR_Value)        raw += W_FAT_RANGE;
+   if(state.displacement_valid) raw += W_FAT_DISP;
+   if(state.quality == CLEAN)   raw += W_FAT_QUAL;
 
    MqlDateTime t; TimeToStruct(ny, t);
-   if(t.hour == 9 && t.min <= 40) score += 5;
+   if(t.hour == 9 && t.min <= 40) raw += W_FAT_TIME;
 
-   state.fat_tail_score  = score;
-   state.fat_tail_active = (score >= 20);
+   state.fat_tail_score  = NormalizeFatTail(raw);            // 0–100
+   state.fat_tail_active = (state.fat_tail_score >= FAT_ACTIVE_THRESH);  // same 2/3-of-max gate
 }
 
 //================ NO TRADE =================//
 void UpdateNoTradeState(datetime ny)
 {
-   int score = 0;
-
-   // Closed M5 bar range
+   double score = 0.0;
    double range = iHigh(_Symbol, PERIOD_M5, 1) - iLow(_Symbol, PERIOD_M5, 1);
 
-   if(range < ATR_Value * 0.5)    score += 25;
-   if(state.quality == CHOP)      score += 20;
-   if(!state.displacement_valid)  score += 15;
-   if(!state.sweep_detected)      score += 15;
-   if(!state.smt_confirmed)       score += 10;
+   if(range < ATR_Value * 0.5)    score += W_NOTRADE_RANGE;
+   if(state.quality == CHOP)      score += W_NOTRADE_CHOP;
+   if(!state.displacement_valid)  score += W_NOTRADE_NODISP;
+   if(!state.sweep_detected)      score += W_NOTRADE_NOSWEEP;
+   if(!state.smt_confirmed)       score += W_NOTRADE_NOSMT;
 
    MqlDateTime t; TimeToStruct(ny, t);
-   if(!(t.hour == 9 && t.min >= 30 && t.min <= 45)) score += 15;
+   if(!(t.hour == 9 && t.min >= 30 && t.min <= 45)) score += W_NOTRADE_WINDOW;
 
-   state.no_trade_score = score;
-   state.no_trade_day   = (score >= 60);
+   state.no_trade_score = score;                      // 0–100, components sum to exactly 100
+   state.no_trade_day   = (score >= NOTRADE_THRESH);
 }
 
 //================ SCORING =================//
 void CalculateScore(datetime ny)
 {
-   int total = 0;
+   double raw = 0.0;
 
-   if(state.sweep_detected)      total += 20;
-   if(state.displacement_valid)  total += 20;
-   if(state.quality == CLEAN)    total += 10;
+   if(state.sweep_detected)      raw += W_TOTAL_SWEEP;
+   if(state.displacement_valid)  raw += W_TOTAL_DISP;
+   if(state.quality == CLEAN)    raw += W_TOTAL_QUAL;
 
    MqlDateTime t; TimeToStruct(ny, t);
-   if(t.hour == 9 && t.min >= 30 && t.min <= 45) total += 10;
+   if(t.hour == 9 && t.min >= 30 && t.min <= 45) raw += W_TOTAL_TIME;
 
-   if(state.mitigation_valid)    total += 10;
-   total += state.smt_score;
-   total += (int)MathRound(state.fat_tail_score / 3.0);
+   if(state.mitigation_valid)    raw += W_TOTAL_MITIG;
 
-   state.total_score = total;
+   // SMT: exact fractional contribution — no integer truncation
+   raw += (state.smt_score / 15.0) * W_TOTAL_SMT;
+
+   // Fat tail: passes through its normalized 0–100 value scaled to its weight ceiling
+   // Eliminates the integer division truncation of the former fat_tail_score / 3
+   raw += (state.fat_tail_score / 100.0) * W_TOTAL_FAT;
+
+   state.total_score = NormalizeTotal(raw);           // 0–100
 }
 
 //================ PRESS =================//
 void CalculatePressScore(datetime ny)
 {
-   // Start from total_score — all components already encoded
-   int score = state.total_score;
+   // Computed entirely from raw components — zero dependency on total_score.
+   // W_PRESS_* weights sum to 100.0, making the score range [0, 100] before deduction.
+   double score = 0.0;
 
-   // Press-specific bonuses use boolean flags, not raw sub-scores,
-   // preventing double-counting of smt_score and fat_tail_score
-   if(state.fat_tail_active) score += 15;
-   if(state.smt_confirmed)   score += 10;
-   if(state.quality == CLEAN) score += 10;
-   if(state.no_trade_day)     score -= 20;
+   score += (state.fat_tail_score / 100.0) * W_PRESS_FAT;  // 0.0 – 30.0
+   score += (state.smt_score / 15.0)       * W_PRESS_SMT;  // 0.0 – 25.0
+   if(state.quality == CLEAN)    score += W_PRESS_QUAL;     // 0.0 or 20.0
+   if(state.sweep_detected)      score += W_PRESS_SWEEP;    // 0.0 or 15.0
+   if(state.displacement_valid)  score += W_PRESS_DISP;     // 0.0 or 10.0
+   // raw max = 100.0
 
-   state.press_score = score;
+   if(state.no_trade_day) score -= PRESS_NO_TRADE_DED;
+
+   state.press_score = ClampScore(score);                   // 0–100
    // risk_multiplier is assigned exclusively in FinalDecision
 }
 
@@ -411,7 +471,7 @@ void FinalDecision()
    if(!state.sweep_detected)     { state.decision = "WAIT SWEEP";        return; }
    if(!state.displacement_valid) { state.decision = "WAIT DISPLACEMENT"; return; }
 
-   if(state.total_score < 65)
+   if(state.total_score < TOTAL_TRADE_THRESH)
    {
       state.decision = "SKIP";
       return;
@@ -421,16 +481,16 @@ void FinalDecision()
    state.direction = state.sweep_direction;
 
    // Single authoritative risk assignment — not set anywhere else
-   if     (state.press_score >= 80) state.risk_multiplier = 2.0;
-   else if(state.press_score >= 65) state.risk_multiplier = 1.5;
-   else if(state.press_score >= 50) state.risk_multiplier = 1.0;
-   else                             state.risk_multiplier = 0.5;
+   if     (state.press_score >= 80.0) state.risk_multiplier = 2.0;
+   else if(state.press_score >= 65.0) state.risk_multiplier = 1.5;
+   else if(state.press_score >= 50.0) state.risk_multiplier = 1.0;
+   else                               state.risk_multiplier = 0.5;
 
    state.decision = "TRADE";
 
-   if(state.press_score >= 80 &&
-      state.fat_tail_active   &&
-      state.smt_confirmed     &&
+   if(state.press_score >= PRESS_2R_THRESH &&
+      state.fat_tail_active                &&
+      state.smt_confirmed                  &&
       state.quality == CLEAN)
    {
       state.decision        = "PRESS 2R";
@@ -457,10 +517,10 @@ void RenderDashboard(datetime ny)
    txt += "\nDISP: "     + (string)state.displacement_valid;
    txt += "\nMITIG: "    + (string)state.mitigation_valid;
    txt += "\n\nSMT: "    + IntegerToString(state.smt_score);
-   txt += "\nFAT: "      + IntegerToString(state.fat_tail_score);
-   txt += "\n\nTOTAL: "   + IntegerToString(state.total_score);
-   txt += "\nNO TRADE: " + IntegerToString(state.no_trade_score);
-   txt += "\nPRESS: "    + IntegerToString(state.press_score);
+   txt += "\nFAT: "      + DoubleToString(state.fat_tail_score, 1);
+   txt += "\n\nTOTAL: "   + DoubleToString(state.total_score,    1);
+   txt += "\nNO TRADE: " + DoubleToString(state.no_trade_score,  1);
+   txt += "\nPRESS: "    + DoubleToString(state.press_score,     1);
    txt += "\n\nDECISION: "  + state.decision;
    txt += "\nDIRECTION: "   + dir_str;
    txt += "\nRISK: "        + DoubleToString(state.risk_multiplier, 1);
