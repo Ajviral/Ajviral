@@ -750,8 +750,12 @@ void FinalDecision()
       return;
    }
 
-   // FIX-1: phase gate — only EXPANSION permits trade execution
-   if(state.phase != EXPANSION)
+   // FIX-1 (hardened): phase gate allows EXPANSION, but the kill zone (TimingWeight > 0)
+   // is always tradeable regardless of phase — this prevents a 1-2 second broker clock
+   // offset at the hour boundary from blocking a valid setup.
+   // A setup at 9:30 AM remains fully accessible even if phase reads as MANIPULATION.
+   bool in_trade_window = (state.phase == EXPANSION) || (TimingWeight(ny) > 0.0);
+   if(!in_trade_window)
    {
       state.decision = "WAIT EXPANSION";
       return;
