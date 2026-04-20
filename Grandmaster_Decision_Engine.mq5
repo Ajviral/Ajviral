@@ -439,6 +439,22 @@ bool SMTLoadSymbol(string sym)
    return true;
 }
 
+// Time-sync helper: maps a self-symbol bar index to the correct bar index on the target symbol.
+// Uses iBarShift to find the target bar whose open time matches the self bar's open time.
+// Returns -1 if the matched bar is more than one M5 period (300 s) away from the expected time —
+// this catches broker data gaps where iBarShift would otherwise silently return the wrong bar.
+int SMTSyncShift(string target_sym, int self_shift)
+{
+   datetime bar_time = iTime(_Symbol, PERIOD_M5, self_shift);
+   if(bar_time <= 0) return -1;
+   int tgt = iBarShift(target_sym, PERIOD_M5, bar_time, false);
+   if(tgt < 0) return -1;
+   datetime matched = iTime(target_sym, PERIOD_M5, tgt);
+   if(MathAbs((long)(matched - bar_time)) > 300) return -1;   // > 5-min gap = reject
+   return tgt;
+}
+
+// Self-symbol swing helpers — read _Symbol directly by index (no sync needed on same symbol)
 double SMTSwingLow(string sym, int bar_from, int bar_to)
 {
    double lo = DBL_MAX;
@@ -485,6 +501,68 @@ int SMTSwingHighBar(string sym, int bar_from, int bar_to)
    return idx;
 }
 
+// Time-synchronized target-symbol swing helpers.
+// Iterates over self-symbol bar indices, maps each to the corresponding target bar via
+// SMTSyncShift(), then reads the target symbol's price at the time-correct index.
+// Any bar where the target has a data gap (SMTSyncShift returns -1) is skipped entirely,
+// preventing false divergence signals from misaligned broker data histories.
+double SMTSwingLowSynced(string sym, int bar_from, int bar_to)
+{
+   double lo = DBL_MAX;
+   for(int i = bar_from; i <= bar_to; i++)
+   {
+      int tgt = SMTSyncShift(sym, i);
+      if(tgt < 0) continue;
+      double v = iLow(sym, PERIOD_M5, tgt);
+      if(v > 0.0 && v < lo) lo = v;
+   }
+   return (lo == DBL_MAX) ? 0.0 : lo;
+}
+
+double SMTSwingHighSynced(string sym, int bar_from, int bar_to)
+{
+   double hi = 0.0;
+   for(int i = bar_from; i <= bar_to; i++)
+   {
+      int tgt = SMTSyncShift(sym, i);
+      if(tgt < 0) continue;
+      double v = iHigh(sym, PERIOD_M5, tgt);
+      if(v > hi) hi = v;
+   }
+   return hi;
+}
+
+// Returns the self-symbol bar index at which the target symbol hit its swing low.
+// Keeping this in self-symbol time allows the timing delta (td) calculation in
+// UpdateSMT to remain a meaningful measure of how close in time the divergence occurred.
+int SMTSwingLowBarSynced(string sym, int bar_from, int bar_to)
+{
+   double lo  = DBL_MAX;
+   int    idx = bar_from;
+   for(int i = bar_from; i <= bar_to; i++)
+   {
+      int tgt = SMTSyncShift(sym, i);
+      if(tgt < 0) continue;
+      double v = iLow(sym, PERIOD_M5, tgt);
+      if(v > 0.0 && v < lo) { lo = v; idx = i; }
+   }
+   return idx;
+}
+
+int SMTSwingHighBarSynced(string sym, int bar_from, int bar_to)
+{
+   double hi  = 0.0;
+   int    idx = bar_from;
+   for(int i = bar_from; i <= bar_to; i++)
+   {
+      int tgt = SMTSyncShift(sym, i);
+      if(tgt < 0) continue;
+      double v = iHigh(sym, PERIOD_M5, tgt);
+      if(v > hi) { hi = v; idx = i; }
+   }
+   return idx;
+}
+
 //================ SMT =================//
 void UpdateSMT()
 {
@@ -508,11 +586,14 @@ void UpdateSMT()
    const int SW1 = 2, SW2 = 3;   // self (sweep-bar-safe)
    const int R1  = 4, R2  = 6;   // reference
 
-   double tgt_w_low   = SMTSwingLow (target,  W1,  W2);
-   double tgt_w_high  = SMTSwingHigh(target,  W1,  W2);
-   double tgt_r_low   = SMTSwingLow (target,  R1,  R2);
-   double tgt_r_high  = SMTSwingHigh(target,  R1,  R2);
+   // Target reads use time-synchronized helpers — maps self-symbol bar timestamps to the
+   // correct target bar via iBarShift, rejecting any bar where the target has a data gap.
+   double tgt_w_low   = SMTSwingLowSynced (target,  W1,  W2);
+   double tgt_w_high  = SMTSwingHighSynced(target,  W1,  W2);
+   double tgt_r_low   = SMTSwingLowSynced (target,  R1,  R2);
+   double tgt_r_high  = SMTSwingHighSynced(target,  R1,  R2);
 
+   // Self reads use direct index helpers — same symbol, no time-sync needed
    double self_w_low  = SMTSwingLow (_Symbol, SW1, SW2);
    double self_w_high = SMTSwingHigh(_Symbol, SW1, SW2);
    double self_r_low  = SMTSwingLow (_Symbol, R1,  R2);
@@ -524,10 +605,10 @@ void UpdateSMT()
       self_w_low <= 0.0 || self_w_high <= 0.0  ||
       self_r_low <= 0.0 || self_r_high <= 0.0) return;
 
-   int tgt_low_bar   = SMTSwingLowBar (target,  W1,  W2);
-   int tgt_high_bar  = SMTSwingHighBar(target,  W1,  W2);
-   int self_low_bar  = SMTSwingLowBar (_Symbol, SW1, SW2);
-   int self_high_bar = SMTSwingHighBar(_Symbol, SW1, SW2);
+   int tgt_low_bar   = SMTSwingLowBarSynced (target,  W1,  W2);
+   int tgt_high_bar  = SMTSwingHighBarSynced(target,  W1,  W2);
+   int self_low_bar  = SMTSwingLowBar       (_Symbol, SW1, SW2);
+   int self_high_bar = SMTSwingHighBar      (_Symbol, SW1, SW2);
 
    int score = 0;
 
