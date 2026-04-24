@@ -1,12 +1,14 @@
 //+------------------------------------------------------------------+
-//| ELITE GRANDMASTER DECISION ENGINE v2.2                          |
+//| ELITE GRANDMASTER DECISION ENGINE v2.3                          |
 //| Institutional ICT/SMT Analysis System for MetaTrader 5          |
 //+------------------------------------------------------------------+
 #property indicator_chart_window
 #property indicator_plots 0
 
-input int    Timer_Seconds = 5;
-input int    ATR_Period     = 14;
+input int    Timer_Seconds      = 5;
+input int    ATR_Period         = 14;
+input int    Sweep_Persist_Bars = 10;
+input int    Leg_Bars           = 8;
 input string NAS100 = "NAS100";
 input string US30   = "US30";
 input string GOLD   = "XAUUSD";
@@ -71,14 +73,15 @@ struct MasterState
    TRADE_DIRECTION  direction;
 };
 
-MasterState state;
-
-int      ATR_Handle;
-double   ATR_Buffer[];
-double   ATR_Value;
-datetime ATR_LastUpdate;
-double   PDH, PDL;
-datetime last_bar_time;
+MasterState     state;
+int             ATR_Handle;
+double          ATR_Buffer[];
+double          ATR_Value;
+datetime        ATR_LastUpdate;
+double          PDH, PDL;
+datetime        last_bar_time;
+int             g_sweep_persist;
+TRADE_DIRECTION g_sweep_dir_cache;
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -90,6 +93,8 @@ int OnInit()
    state.quality         = MIXED;
    state.decision        = "INIT";
    ATR_LastUpdate        = 0;
+   g_sweep_persist       = 0;
+   g_sweep_dir_cache     = DIR_NONE;
 
    ATR_Handle = iATR(_Symbol, PERIOD_M5, ATR_Period);
    if(ATR_Handle == INVALID_HANDLE)
@@ -271,25 +276,31 @@ void UpdateDailyLevels()
    PDL = iLow (_Symbol, PERIOD_D1, 1);
 }
 
+//+------------------------------------------------------------------+
 void DetectSweep()
 {
    double high  = iHigh (_Symbol, PERIOD_M5, 1);
    double low   = iLow  (_Symbol, PERIOD_M5, 1);
    double close = iClose(_Symbol, PERIOD_M5, 1);
 
-   state.sweep_detected  = false;
-   state.sweep_direction = DIR_NONE;
-
    if(high > PDH && close < PDH)
    {
-      state.sweep_detected  = true;
-      state.sweep_direction = DIR_SELL;
+      g_sweep_persist   = Sweep_Persist_Bars;
+      g_sweep_dir_cache = DIR_SELL;
    }
    else if(low < PDL && close > PDL)
    {
-      state.sweep_detected  = true;
-      state.sweep_direction = DIR_BUY;
+      g_sweep_persist   = Sweep_Persist_Bars;
+      g_sweep_dir_cache = DIR_BUY;
    }
+   else
+   {
+      if(g_sweep_persist > 0) g_sweep_persist--;
+      if(g_sweep_persist == 0) g_sweep_dir_cache = DIR_NONE;
+   }
+
+   state.sweep_detected  = (g_sweep_persist > 0);
+   state.sweep_direction = (g_sweep_persist > 0) ? g_sweep_dir_cache : DIR_NONE;
 }
 
 void DetectDisplacement()
@@ -312,7 +323,7 @@ void DetectMitigation()
    if(state.sweep_direction == DIR_BUY)
    {
       double lo = DBL_MAX;
-      for(int i = 1; i <= 8; i++)
+      for(int i = 1; i <= Leg_Bars; i++)
       {
          double v = iLow(_Symbol, PERIOD_M5, i);
          if(v > 0.0 && v < lo) { lo = v; extreme_bar = i; }
@@ -332,7 +343,7 @@ void DetectMitigation()
    else
    {
       double hi = 0.0;
-      for(int i = 1; i <= 8; i++)
+      for(int i = 1; i <= Leg_Bars; i++)
       {
          double v = iHigh(_Symbol, PERIOD_M5, i);
          if(v > hi) { hi = v; extreme_bar = i; }
@@ -376,7 +387,7 @@ void DetectMitigation()
 bool SMTLoadSymbol(string sym)
 {
    if(!SymbolSelect(sym, true)) return false;
-   if(iBars(sym, PERIOD_M5) < 8) return false;
+   if(iBars(sym, PERIOD_M5) < Leg_Bars + 2) return false;
    return true;
 }
 
@@ -692,9 +703,10 @@ void RenderDashboard(datetime ny)
 
    string sweep_detail = "";
    if(state.sweep_detected)
-      sweep_detail = "  DIR: " + (state.sweep_direction == DIR_BUY ? "BUY" : "SELL");
+      sweep_detail = "  DIR: " + (state.sweep_direction == DIR_BUY ? "BUY" : "SELL")
+                   + "  [" + IntegerToString(g_sweep_persist) + " bars]";
 
-   string txt = "====== ELITE GRANDMASTER ENGINE v2.2 ======\n";
+   string txt = "====== ELITE GRANDMASTER ENGINE v2.3 ======\n";
    txt += "TIME:      " + TimeToString(ny, TIME_MINUTES) + "\n";
    txt += "\nPHASE:     " + EnumToString(state.phase);
    txt += "\nWINDOW:    " + window_str;
