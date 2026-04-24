@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| ELITE GRANDMASTER DECISION ENGINE v2.1                          |
+//| ELITE GRANDMASTER DECISION ENGINE v2.2                          |
 //| Institutional ICT/SMT Analysis System for MetaTrader 5          |
 //+------------------------------------------------------------------+
 #property indicator_chart_window
@@ -47,7 +47,8 @@ const double W_NOTRADE_NOSMT   = 10.0;
 const double W_NOTRADE_WINDOW  = 15.0;
 const double NOTRADE_THRESH    = 60.0;
 
-const int ATR_STALE_SECONDS = 300;
+const int    ATR_STALE_SECONDS  = 300;
+const double MIN_LEG_ATR_RATIO  = 0.3;
 
 struct MasterState
 {
@@ -78,7 +79,6 @@ double   ATR_Value;
 datetime ATR_LastUpdate;
 double   PDH, PDL;
 datetime last_bar_time;
-datetime g_impulse_time = 0;
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -90,7 +90,6 @@ int OnInit()
    state.quality         = MIXED;
    state.decision        = "INIT";
    ATR_LastUpdate        = 0;
-   g_impulse_time        = 0;
 
    ATR_Handle = iATR(_Symbol, PERIOD_M5, ATR_Period);
    if(ATR_Handle == INVALID_HANDLE)
@@ -146,7 +145,7 @@ void OnTimer()
    UpdateFatTailState(ny);
    UpdateNoTradeState(ny);
    CalculateScore(ny);
-   CalculatePressScore(ny);
+   CalculatePressScore();
    FinalDecision(ny);
    RenderDashboard(ny);
 }
@@ -301,62 +300,76 @@ void DetectDisplacement()
 }
 
 //+------------------------------------------------------------------+
-int FindImpulseOrigin(int bar_from, int bar_to)
-{
-   for(int i = bar_from; i <= bar_to; i++)
-   {
-      double body  = MathAbs(iClose(_Symbol, PERIOD_M5, i) - iOpen(_Symbol, PERIOD_M5, i));
-      double range = iHigh (_Symbol, PERIOD_M5, i) - iLow(_Symbol, PERIOD_M5, i);
-      if(range > 0.0 && body > ATR_Value * 0.5) return i;
-   }
-   return -1;
-}
-
 void DetectMitigation()
 {
    state.mitigation_valid = false;
+   if(!state.sweep_detected) return;
 
-   if(!state.sweep_detected) { g_impulse_time = 0; return; }
+   double leg_extreme = 0.0;
+   double leg_counter = 0.0;
+   int    extreme_bar = -1;
 
-   int origin = -1;
-   if(g_impulse_time > 0)
+   if(state.sweep_direction == DIR_BUY)
    {
-      for(int i = 2; i <= 8; i++)
-         if(iTime(_Symbol, PERIOD_M5, i) == g_impulse_time) { origin = i; break; }
+      double lo = DBL_MAX;
+      for(int i = 1; i <= 8; i++)
+      {
+         double v = iLow(_Symbol, PERIOD_M5, i);
+         if(v > 0.0 && v < lo) { lo = v; extreme_bar = i; }
+      }
+      if(extreme_bar < 2) return;
+      leg_extreme = lo;
+
+      double hi = 0.0;
+      for(int i = 1; i < extreme_bar; i++)
+      {
+         double v = iHigh(_Symbol, PERIOD_M5, i);
+         if(v > hi) hi = v;
+      }
+      if(hi <= 0.0) return;
+      leg_counter = hi;
    }
-   if(origin < 0)
+   else
    {
-      origin = FindImpulseOrigin(2, 8);
-      if(origin < 0) return;
-      g_impulse_time = iTime(_Symbol, PERIOD_M5, origin);
+      double hi = 0.0;
+      for(int i = 1; i <= 8; i++)
+      {
+         double v = iHigh(_Symbol, PERIOD_M5, i);
+         if(v > hi) { hi = v; extreme_bar = i; }
+      }
+      if(extreme_bar < 2) return;
+      leg_extreme = hi;
+
+      double lo = DBL_MAX;
+      for(int i = 1; i < extreme_bar; i++)
+      {
+         double v = iLow(_Symbol, PERIOD_M5, i);
+         if(v > 0.0 && v < lo) lo = v;
+      }
+      if(lo == DBL_MAX) return;
+      leg_counter = lo;
    }
 
-   double imp_open  = iOpen (_Symbol, PERIOD_M5, origin);
-   double imp_close = iClose(_Symbol, PERIOD_M5, origin);
-   double imp_range = MathAbs(imp_close - imp_open);
-   if(imp_range <= 0.0) return;
-
-   bool bullish_impulse = (imp_close > imp_open);
-   if(state.sweep_direction == DIR_BUY  && !bullish_impulse) return;
-   if(state.sweep_direction == DIR_SELL &&  bullish_impulse) return;
+   double leg_range = MathAbs(leg_counter - leg_extreme);
+   if(leg_range < ATR_Value * MIN_LEG_ATR_RATIO) return;
 
    double eval_close  = iClose(_Symbol, PERIOD_M5, 1);
    double retracement = 0.0;
 
-   if(bullish_impulse)
+   if(state.sweep_direction == DIR_BUY)
    {
-      if(eval_close >= imp_open && eval_close < imp_close)
-         retracement = (imp_close - eval_close) / imp_range;
-      else return;
+      if(eval_close <= leg_extreme || eval_close >= leg_counter) return;
+      retracement = (leg_counter - eval_close) / leg_range;
+      if(eval_close < PDL) return;
    }
    else
    {
-      if(eval_close > imp_close && eval_close <= imp_open)
-         retracement = (eval_close - imp_close) / imp_range;
-      else return;
+      if(eval_close >= leg_extreme || eval_close <= leg_counter) return;
+      retracement = (eval_close - leg_counter) / leg_range;
+      if(eval_close > PDH) return;
    }
 
-   state.mitigation_valid = (retracement >= 0.20 && retracement <= 0.50);
+   state.mitigation_valid = (retracement >= 0.15 && retracement <= 0.65);
 }
 
 //+------------------------------------------------------------------+
@@ -606,7 +619,7 @@ void CalculateScore(datetime ny)
 }
 
 //+------------------------------------------------------------------+
-void CalculatePressScore(datetime ny)
+void CalculatePressScore()
 {
    double score = 0.0;
    score += (state.fat_tail_score / 100.0) * W_PRESS_FAT;
@@ -681,7 +694,7 @@ void RenderDashboard(datetime ny)
    if(state.sweep_detected)
       sweep_detail = "  DIR: " + (state.sweep_direction == DIR_BUY ? "BUY" : "SELL");
 
-   string txt = "====== ELITE GRANDMASTER ENGINE v2.1 ======\n";
+   string txt = "====== ELITE GRANDMASTER ENGINE v2.2 ======\n";
    txt += "TIME:      " + TimeToString(ny, TIME_MINUTES) + "\n";
    txt += "\nPHASE:     " + EnumToString(state.phase);
    txt += "\nWINDOW:    " + window_str;
