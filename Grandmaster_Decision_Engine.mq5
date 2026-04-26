@@ -1,14 +1,13 @@
 //+------------------------------------------------------------------+
-//| ELITE GRANDMASTER DECISION ENGINE v2.4                          |
+//| ELITE GRANDMASTER DECISION ENGINE v2.5                          |
 //| Institutional ICT/SMT Analysis System for MetaTrader 5          |
 //+------------------------------------------------------------------+
 #property indicator_chart_window
 #property indicator_plots 0
 
-input int    Timer_Seconds      = 5;
-input int    ATR_Period         = 14;
-input int    Sweep_Persist_Bars = 10;
-input int    Leg_Bars           = 12;
+input int    Timer_Seconds = 5;
+input int    ATR_Period    = 14;
+input int    Leg_Bars      = 12;
 input string NAS100 = "NAS100";
 input string US30   = "US30";
 input string GOLD   = "XAUUSD";
@@ -49,8 +48,8 @@ const double W_NOTRADE_NOSMT   = 10.0;
 const double W_NOTRADE_WINDOW  = 15.0;
 const double NOTRADE_THRESH    = 60.0;
 
-const int    ATR_STALE_SECONDS  = 300;
-const double MIN_LEG_ATR_RATIO  = 0.3;
+const int    ATR_STALE_SECONDS = 300;
+const double MIN_LEG_ATR_RATIO = 0.3;
 
 struct MasterState
 {
@@ -83,6 +82,7 @@ datetime        last_bar_time;
 int             g_sweep_persist;
 TRADE_DIRECTION g_sweep_dir_cache;
 int             g_leg_bars;
+int             g_sweep_persist_bars;
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -97,18 +97,8 @@ int OnInit()
    g_sweep_persist       = 0;
    g_sweep_dir_cache     = DIR_NONE;
 
-   int min_leg = Sweep_Persist_Bars + 2;
-   if(Leg_Bars < min_leg)
-   {
-      g_leg_bars = min_leg;
-      Alert("ELITE GRANDMASTER: Leg_Bars (" + IntegerToString(Leg_Bars) +
-            ") < Sweep_Persist_Bars + 2 (" + IntegerToString(min_leg) +
-            "). Auto-corrected to " + IntegerToString(g_leg_bars) + ".");
-   }
-   else
-   {
-      g_leg_bars = Leg_Bars;
-   }
+   g_leg_bars           = MathMax(Leg_Bars, 4);
+   g_sweep_persist_bars = MathMax(g_leg_bars - 2, 2);
 
    ATR_Handle = iATR(_Symbol, PERIOD_M5, ATR_Period);
    if(ATR_Handle == INVALID_HANDLE)
@@ -299,12 +289,12 @@ void DetectSweep()
 
    if(high > PDH && close < PDH)
    {
-      g_sweep_persist   = Sweep_Persist_Bars;
+      g_sweep_persist   = g_sweep_persist_bars;
       g_sweep_dir_cache = DIR_SELL;
    }
    else if(low < PDL && close > PDL)
    {
-      g_sweep_persist   = Sweep_Persist_Bars;
+      g_sweep_persist   = g_sweep_persist_bars;
       g_sweep_dir_cache = DIR_BUY;
    }
    else
@@ -720,11 +710,7 @@ void RenderDashboard(datetime ny)
       sweep_detail = "  DIR: " + (state.sweep_direction == DIR_BUY ? "BUY" : "SELL")
                    + "  [" + IntegerToString(g_sweep_persist) + " bars]";
 
-   string leg_note = (g_leg_bars != Leg_Bars)
-                   ? " [AUTO:" + IntegerToString(g_leg_bars) + "]"
-                   : " [" + IntegerToString(g_leg_bars) + "]";
-
-   string txt = "====== ELITE GRANDMASTER ENGINE v2.4 ======\n";
+   string txt = "====== ELITE GRANDMASTER ENGINE v2.5 ======\n";
    txt += "TIME:      " + TimeToString(ny, TIME_MINUTES) + "\n";
    txt += "\nPHASE:     " + EnumToString(state.phase);
    txt += "\nWINDOW:    " + window_str;
@@ -733,7 +719,8 @@ void RenderDashboard(datetime ny)
    txt += "\nSWEEP:     " + (string)state.sweep_detected + sweep_detail;
    txt += "\nDISP:      " + (string)state.displacement_valid;
    txt += "\nMITIG:     " + (string)state.mitigation_valid;
-   txt += "\nLEG WIN:   " + IntegerToString(Sweep_Persist_Bars) + "/" + IntegerToString(g_leg_bars) + leg_note;
+   txt += "\nLEG WIN:   persist=" + IntegerToString(g_sweep_persist_bars)
+        + "  leg=" + IntegerToString(g_leg_bars);
    txt += "\n";
    txt += "\nSMT:       " + IntegerToString(state.smt_score)
         + "  [" + (state.smt_confirmed ? "CONFIRMED" : "WEAK") + "]";
