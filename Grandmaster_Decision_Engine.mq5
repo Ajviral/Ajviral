@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| ELITE GRANDMASTER DECISION ENGINE v2.5                          |
+//| ELITE GRANDMASTER DECISION ENGINE v2.6                          |
 //| Institutional ICT/SMT Analysis System for MetaTrader 5          |
 //+------------------------------------------------------------------+
 #property indicator_chart_window
@@ -231,6 +231,18 @@ double TimingWeight(datetime ny)
 }
 
 //+------------------------------------------------------------------+
+bool PastAssetCutoff(datetime ny)
+{
+   MqlDateTime t; TimeToStruct(ny, t);
+   if(t.hour < 9)  return false;
+   if(t.hour > 9)  return true;
+   if(_Symbol == NAS100) return (t.min > 42);
+   if(_Symbol == US30)   return (t.min > 40);
+   if(_Symbol == GOLD)   return (t.min > 45);
+   return (t.min > 55);
+}
+
+//+------------------------------------------------------------------+
 void UpdateATR()
 {
    if(ATR_Handle == INVALID_HANDLE) return;
@@ -307,11 +319,24 @@ void DetectSweep()
    state.sweep_direction = (g_sweep_persist > 0) ? g_sweep_dir_cache : DIR_NONE;
 }
 
+//+------------------------------------------------------------------+
 void DetectDisplacement()
 {
-   double body  = MathAbs(iClose(_Symbol, PERIOD_M5, 1) - iOpen(_Symbol, PERIOD_M5, 1));
-   double range = iHigh (_Symbol, PERIOD_M5, 1) - iLow(_Symbol, PERIOD_M5, 1);
-   state.displacement_valid = (range > 0.0 && body > ATR_Value * 0.5);
+   state.displacement_valid = false;
+   if(!state.sweep_detected) return;
+
+   for(int i = 1; i <= g_sweep_persist_bars; i++)
+   {
+      double body = MathAbs(iClose(_Symbol, PERIOD_M5, i) - iOpen(_Symbol, PERIOD_M5, i));
+      double range = iHigh(_Symbol, PERIOD_M5, i) - iLow(_Symbol, PERIOD_M5, i);
+      if(range <= 0.0 || body <= ATR_Value * 0.5) continue;
+
+      double c = iClose(_Symbol, PERIOD_M5, i);
+      double o = iOpen (_Symbol, PERIOD_M5, i);
+
+      if(state.sweep_direction == DIR_BUY  && c > o) { state.displacement_valid = true; return; }
+      if(state.sweep_direction == DIR_SELL && c < o) { state.displacement_valid = true; return; }
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -663,6 +688,8 @@ void FinalDecision(datetime ny)
    bool in_trade_window = (state.phase == EXPANSION) || (TimingWeight(ny) > 0.0);
    if(!in_trade_window) { state.decision = "WAIT EXPANSION"; return; }
 
+   if(PastAssetCutoff(ny)) { state.decision = "CUTOFF"; return; }
+
    if(!state.sweep_detected)     { state.decision = "WAIT SWEEP";        return; }
    if(!state.displacement_valid) { state.decision = "WAIT DISPLACEMENT"; return; }
 
@@ -710,7 +737,7 @@ void RenderDashboard(datetime ny)
       sweep_detail = "  DIR: " + (state.sweep_direction == DIR_BUY ? "BUY" : "SELL")
                    + "  [" + IntegerToString(g_sweep_persist) + " bars]";
 
-   string txt = "====== ELITE GRANDMASTER ENGINE v2.5 ======\n";
+   string txt = "====== ELITE GRANDMASTER ENGINE v2.6 ======\n";
    txt += "TIME:      " + TimeToString(ny, TIME_MINUTES) + "\n";
    txt += "\nPHASE:     " + EnumToString(state.phase);
    txt += "\nWINDOW:    " + window_str;
