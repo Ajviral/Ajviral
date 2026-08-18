@@ -1,21 +1,30 @@
 //+------------------------------------------------------------------+
-//| ELITE GRANDMASTER DECISION ENGINE v2.6                          |
+//| ELITE GRANDMASTER DECISION ENGINE v3.0                          |
 //| Institutional ICT/SMT Analysis System for MetaTrader 5          |
 //+------------------------------------------------------------------+
 #property indicator_chart_window
 #property indicator_plots 0
 
-input int    Timer_Seconds = 5;
-input int    ATR_Period    = 14;
-input int    Leg_Bars      = 12;
+input int    Timer_Seconds      = 5;
+input int    ATR_Period         = 14;
+input int    Leg_Bars           = 12;
+input bool   Use_Volume         = true;
+input int    Volume_Bars        = 5;
+input double Volume_Spike_Ratio = 1.5;
+input int    Archetype_Bars     = 20;
+input double Compression_Ratio  = 0.75;
+input double HTF_Proximity_ATR  = 2.0;
+input double Min_RR_Trade       = 2.0;
+input double Min_RR_Press       = 3.0;
 input string NAS100 = "NAS100";
 input string US30   = "US30";
 input string GOLD   = "XAUUSD";
 input string DXY    = "USDX";
 
-enum MARKET_PHASE    { ACCUMULATION, MANIPULATION, EXPANSION, UNKNOWN };
-enum MARKET_QUALITY  { CLEAN, MIXED, CHOP };
-enum TRADE_DIRECTION { DIR_NONE, DIR_BUY, DIR_SELL };
+enum MARKET_PHASE      { ACCUMULATION, MANIPULATION, EXPANSION, UNKNOWN };
+enum MARKET_QUALITY    { CLEAN, MIXED, CHOP };
+enum TRADE_DIRECTION   { DIR_NONE, DIR_BUY, DIR_SELL };
+enum SESSION_ARCHETYPE { ARCH_EXPANSION, ARCH_PROBE, ARCH_BALANCE };
 
 const double W_FAT_RANGE       = 10.0;
 const double W_FAT_TIME        =  5.0;
@@ -37,6 +46,7 @@ const double W_PRESS_SMT        = 25.0;
 const double W_PRESS_QUAL       = 20.0;
 const double W_PRESS_SWEEP      = 15.0;
 const double W_PRESS_DISP       = 10.0;
+const double W_PRESS_VOL        = 10.0;
 const double PRESS_NO_TRADE_DED = 20.0;
 const double PRESS_2R_THRESH    = 80.0;
 
@@ -53,23 +63,29 @@ const double MIN_LEG_ATR_RATIO = 0.3;
 
 struct MasterState
 {
-   MARKET_PHASE     phase;
-   MARKET_QUALITY   quality;
-   bool             no_trade_day;
-   double           no_trade_score;
-   bool             sweep_detected;
-   TRADE_DIRECTION  sweep_direction;
-   bool             displacement_valid;
-   bool             mitigation_valid;
-   int              smt_score;
-   bool             smt_confirmed;
-   double           fat_tail_score;
-   bool             fat_tail_active;
-   double           total_score;
-   double           press_score;
-   double           risk_multiplier;
-   string           decision;
-   TRADE_DIRECTION  direction;
+   MARKET_PHASE      phase;
+   MARKET_QUALITY    quality;
+   SESSION_ARCHETYPE archetype;
+   bool              no_trade_day;
+   double            no_trade_score;
+   bool              sweep_detected;
+   TRADE_DIRECTION   sweep_direction;
+   bool              displacement_valid;
+   bool              volume_confirmed;
+   bool              mitigation_valid;
+   int               mitigation_touch;
+   bool              hierarchy_approved;
+   double            liquidity_target;
+   double            computed_rr;
+   int               smt_score;
+   bool              smt_confirmed;
+   double            fat_tail_score;
+   bool              fat_tail_active;
+   double            total_score;
+   double            press_score;
+   double            risk_multiplier;
+   string            decision;
+   TRADE_DIRECTION   direction;
 };
 
 MasterState     state;
@@ -83,19 +99,27 @@ int             g_sweep_persist;
 TRADE_DIRECTION g_sweep_dir_cache;
 int             g_leg_bars;
 int             g_sweep_persist_bars;
+double          g_leg_extreme_price;
+int             g_mitigation_count;
+bool            g_mitigation_was_valid;
 
 //+------------------------------------------------------------------+
 int OnInit()
 {
    ZeroMemory(state);
-   state.direction       = DIR_NONE;
-   state.sweep_direction = DIR_NONE;
-   state.phase           = UNKNOWN;
-   state.quality         = MIXED;
-   state.decision        = "INIT";
-   ATR_LastUpdate        = 0;
-   g_sweep_persist       = 0;
-   g_sweep_dir_cache     = DIR_NONE;
+   state.direction          = DIR_NONE;
+   state.sweep_direction    = DIR_NONE;
+   state.phase              = UNKNOWN;
+   state.quality            = MIXED;
+   state.archetype          = ARCH_PROBE;
+   state.hierarchy_approved = true;
+   state.decision           = "INIT";
+   ATR_LastUpdate           = 0;
+   g_sweep_persist          = 0;
+   g_sweep_dir_cache        = DIR_NONE;
+   g_leg_extreme_price      = 0.0;
+   g_mitigation_count       = 0;
+   g_mitigation_was_valid   = false;
 
    g_leg_bars           = MathMax(Leg_Bars, 4);
    g_sweep_persist_bars = MathMax(g_leg_bars - 2, 2);
@@ -144,13 +168,16 @@ void OnTimer()
    UpdateATR();
    if(ATR_Value <= 0.0) return;
 
+   UpdateDailyLevels();
+   ClassifySessionArchetype();
    UpdateMarketPhase(ny);
    UpdateMarketQuality();
-   UpdateDailyLevels();
    DetectSweep();
    DetectDisplacement();
    DetectMitigation();
+   UpdateLiquidityTarget();
    UpdateSMT();
+   CheckAssetHierarchy();
    UpdateFatTailState(ny);
    UpdateNoTradeState(ny);
    CalculateScore(ny);
@@ -293,6 +320,37 @@ void UpdateDailyLevels()
 }
 
 //+------------------------------------------------------------------+
+void ClassifySessionArchetype()
+{
+   double prior_range = PDH - PDL;
+   if(prior_range <= 0.0) { state.archetype = ARCH_PROBE; return; }
+
+   double avg_range = 0.0;
+   int    count     = 0;
+   for(int i = 2; i <= Archetype_Bars + 1; i++)
+   {
+      double h = iHigh(_Symbol, PERIOD_D1, i);
+      double l = iLow (_Symbol, PERIOD_D1, i);
+      if(h > 0.0 && l > 0.0 && h > l) { avg_range += (h - l); count++; }
+   }
+   if(count == 0) { state.archetype = ARCH_PROBE; return; }
+   avg_range /= count;
+
+   bool compressed = (prior_range / avg_range < Compression_Ratio);
+
+   double weekly_high = iHigh(_Symbol, PERIOD_W1, 1);
+   double weekly_low  = iLow (_Symbol, PERIOD_W1, 1);
+   double cur_close   = iClose(_Symbol, PERIOD_M5, 1);
+   double proximity   = ATR_Value * HTF_Proximity_ATR;
+   bool   near_htf    = (MathAbs(cur_close - weekly_high) <= proximity ||
+                         MathAbs(cur_close - weekly_low)  <= proximity);
+
+   if     (compressed && near_htf)  state.archetype = ARCH_EXPANSION;
+   else if(compressed || near_htf)  state.archetype = ARCH_PROBE;
+   else                             state.archetype = ARCH_BALANCE;
+}
+
+//+------------------------------------------------------------------+
 void DetectSweep()
 {
    double high  = iHigh (_Symbol, PERIOD_M5, 1);
@@ -301,18 +359,30 @@ void DetectSweep()
 
    if(high > PDH && close < PDH)
    {
-      g_sweep_persist   = g_sweep_persist_bars;
-      g_sweep_dir_cache = DIR_SELL;
+      g_sweep_persist        = g_sweep_persist_bars;
+      g_sweep_dir_cache      = DIR_SELL;
+      g_mitigation_count     = 0;
+      g_mitigation_was_valid = false;
+      g_leg_extreme_price    = 0.0;
    }
    else if(low < PDL && close > PDL)
    {
-      g_sweep_persist   = g_sweep_persist_bars;
-      g_sweep_dir_cache = DIR_BUY;
+      g_sweep_persist        = g_sweep_persist_bars;
+      g_sweep_dir_cache      = DIR_BUY;
+      g_mitigation_count     = 0;
+      g_mitigation_was_valid = false;
+      g_leg_extreme_price    = 0.0;
    }
    else
    {
       if(g_sweep_persist > 0) g_sweep_persist--;
-      if(g_sweep_persist == 0) g_sweep_dir_cache = DIR_NONE;
+      if(g_sweep_persist == 0)
+      {
+         g_sweep_dir_cache      = DIR_NONE;
+         g_mitigation_count     = 0;
+         g_mitigation_was_valid = false;
+         g_leg_extreme_price    = 0.0;
+      }
    }
 
    state.sweep_detected  = (g_sweep_persist > 0);
@@ -320,31 +390,59 @@ void DetectSweep()
 }
 
 //+------------------------------------------------------------------+
+bool CheckVolumeSpike(int disp_bar)
+{
+   if(!Use_Volume) return false;
+   long disp_vol = iVolume(_Symbol, PERIOD_M5, disp_bar);
+   if(disp_vol <= 0) return false;
+
+   double avg_vol = 0.0;
+   int    count   = 0;
+   for(int i = disp_bar + 1; i <= disp_bar + Volume_Bars; i++)
+   {
+      long v = iVolume(_Symbol, PERIOD_M5, i);
+      if(v > 0) { avg_vol += v; count++; }
+   }
+   if(count == 0) return false;
+   avg_vol /= count;
+
+   return (disp_vol >= avg_vol * Volume_Spike_Ratio);
+}
+
+//+------------------------------------------------------------------+
 void DetectDisplacement()
 {
    state.displacement_valid = false;
+   state.volume_confirmed   = false;
    if(!state.sweep_detected) return;
 
    for(int i = 1; i <= g_sweep_persist_bars; i++)
    {
-      double body = MathAbs(iClose(_Symbol, PERIOD_M5, i) - iOpen(_Symbol, PERIOD_M5, i));
-      double range = iHigh(_Symbol, PERIOD_M5, i) - iLow(_Symbol, PERIOD_M5, i);
+      double body  = MathAbs(iClose(_Symbol, PERIOD_M5, i) - iOpen(_Symbol, PERIOD_M5, i));
+      double range = iHigh (_Symbol, PERIOD_M5, i) - iLow(_Symbol, PERIOD_M5, i);
       if(range <= 0.0 || body <= ATR_Value * 0.5) continue;
 
       double c = iClose(_Symbol, PERIOD_M5, i);
       double o = iOpen (_Symbol, PERIOD_M5, i);
 
-      if(state.sweep_direction == DIR_BUY  && c > o) { state.displacement_valid = true; return; }
-      if(state.sweep_direction == DIR_SELL && c < o) { state.displacement_valid = true; return; }
+      if(state.sweep_direction == DIR_BUY  && c > o)
+      {
+         state.displacement_valid = true;
+         state.volume_confirmed   = CheckVolumeSpike(i);
+         return;
+      }
+      if(state.sweep_direction == DIR_SELL && c < o)
+      {
+         state.displacement_valid = true;
+         state.volume_confirmed   = CheckVolumeSpike(i);
+         return;
+      }
    }
 }
 
 //+------------------------------------------------------------------+
-void DetectMitigation()
+bool EvaluateMitigation()
 {
-   state.mitigation_valid = false;
-   if(!state.sweep_detected) return;
-
    double leg_extreme = 0.0;
    double leg_counter = 0.0;
    int    extreme_bar = -1;
@@ -357,7 +455,7 @@ void DetectMitigation()
          double v = iLow(_Symbol, PERIOD_M5, i);
          if(v > 0.0 && v < lo) { lo = v; extreme_bar = i; }
       }
-      if(extreme_bar < 2) return;
+      if(extreme_bar < 2) return false;
       leg_extreme = lo;
 
       double hi = 0.0;
@@ -366,7 +464,7 @@ void DetectMitigation()
          double v = iHigh(_Symbol, PERIOD_M5, i);
          if(v > hi) hi = v;
       }
-      if(hi <= 0.0) return;
+      if(hi <= 0.0) return false;
       leg_counter = hi;
    }
    else
@@ -377,7 +475,7 @@ void DetectMitigation()
          double v = iHigh(_Symbol, PERIOD_M5, i);
          if(v > hi) { hi = v; extreme_bar = i; }
       }
-      if(extreme_bar < 2) return;
+      if(extreme_bar < 2) return false;
       leg_extreme = hi;
 
       double lo = DBL_MAX;
@@ -386,30 +484,78 @@ void DetectMitigation()
          double v = iLow(_Symbol, PERIOD_M5, i);
          if(v > 0.0 && v < lo) lo = v;
       }
-      if(lo == DBL_MAX) return;
+      if(lo == DBL_MAX) return false;
       leg_counter = lo;
    }
 
    double leg_range = MathAbs(leg_counter - leg_extreme);
-   if(leg_range < ATR_Value * MIN_LEG_ATR_RATIO) return;
+   if(leg_range < ATR_Value * MIN_LEG_ATR_RATIO) return false;
+
+   g_leg_extreme_price = leg_extreme;
 
    double eval_close  = iClose(_Symbol, PERIOD_M5, 1);
    double retracement = 0.0;
 
    if(state.sweep_direction == DIR_BUY)
    {
-      if(eval_close <= leg_extreme || eval_close >= leg_counter) return;
+      if(eval_close <= leg_extreme || eval_close >= leg_counter) return false;
       retracement = (leg_counter - eval_close) / leg_range;
-      if(eval_close < PDL) return;
+      if(eval_close < PDL) return false;
    }
    else
    {
-      if(eval_close >= leg_extreme || eval_close <= leg_counter) return;
+      if(eval_close >= leg_extreme || eval_close <= leg_counter) return false;
       retracement = (eval_close - leg_counter) / leg_range;
-      if(eval_close > PDH) return;
+      if(eval_close > PDH) return false;
    }
 
-   state.mitigation_valid = (retracement >= 0.15 && retracement <= 0.65);
+   return (retracement >= 0.15 && retracement <= 0.65);
+}
+
+void DetectMitigation()
+{
+   state.mitigation_valid = false;
+   state.mitigation_touch = 0;
+   if(!state.sweep_detected) return;
+
+   state.mitigation_valid = EvaluateMitigation();
+
+   if(state.mitigation_valid && !g_mitigation_was_valid) g_mitigation_count++;
+   g_mitigation_was_valid = state.mitigation_valid;
+   state.mitigation_touch = g_mitigation_count;
+}
+
+//+------------------------------------------------------------------+
+void UpdateLiquidityTarget()
+{
+   state.liquidity_target = 0.0;
+   state.computed_rr      = 0.0;
+
+   if(g_leg_extreme_price <= 0.0)        return;
+   if(state.sweep_direction == DIR_NONE) return;
+
+   double current   = iClose(_Symbol, PERIOD_M5, 1);
+   double stop_dist = MathAbs(current - g_leg_extreme_price);
+   if(stop_dist < _Point) return;
+
+   double target      = 0.0;
+   double target_dist = 0.0;
+
+   if(state.sweep_direction == DIR_BUY)
+   {
+      target = PDH;
+      if(target <= current) return;
+      target_dist = target - current;
+   }
+   else
+   {
+      target = PDL;
+      if(target >= current) return;
+      target_dist = current - target;
+   }
+
+   state.liquidity_target = target;
+   state.computed_rr      = target_dist / stop_dist;
 }
 
 //+------------------------------------------------------------------+
@@ -532,6 +678,38 @@ int SMTSwingHighBarSynced(string sym, int bar_from, int bar_to)
 }
 
 //+------------------------------------------------------------------+
+TRADE_DIRECTION GetIndexBias(string sym)
+{
+   if(!SMTLoadSymbol(sym)) return DIR_NONE;
+   double h       = iHigh (sym, PERIOD_M5, 1);
+   double l       = iLow  (sym, PERIOD_M5, 1);
+   double c       = iClose(sym, PERIOD_M5, 1);
+   double sym_pdh = iHigh (sym, PERIOD_D1, 1);
+   double sym_pdl = iLow  (sym, PERIOD_D1, 1);
+   if(h > sym_pdh && c < sym_pdh) return DIR_SELL;
+   if(l < sym_pdl && c > sym_pdl) return DIR_BUY;
+   return DIR_NONE;
+}
+
+void CheckAssetHierarchy()
+{
+   state.hierarchy_approved = true;
+   if(_Symbol == GOLD)                    return;
+   if(state.sweep_direction == DIR_NONE)  return;
+
+   string peer = "";
+   if     (_Symbol == NAS100) peer = US30;
+   else if(_Symbol == US30)   peer = NAS100;
+   if(peer == "")                         return;
+
+   TRADE_DIRECTION peer_bias = GetIndexBias(peer);
+   if(peer_bias == DIR_NONE)              return;
+
+   if(peer_bias != state.sweep_direction)
+      state.hierarchy_approved = false;
+}
+
+//+------------------------------------------------------------------+
 void UpdateSMT()
 {
    state.smt_score     = 0;
@@ -555,7 +733,6 @@ void UpdateSMT()
    double tgt_w_high  = SMTSwingHighSynced(target,  W1,  W2);
    double tgt_r_low   = SMTSwingLowSynced (target,  R1,  R2);
    double tgt_r_high  = SMTSwingHighSynced(target,  R1,  R2);
-
    double self_w_low  = SMTSwingLow (_Symbol, SW1, SW2);
    double self_w_high = SMTSwingHigh(_Symbol, SW1, SW2);
    double self_r_low  = SMTSwingLow (_Symbol, R1,  R2);
@@ -664,10 +841,11 @@ void CalculatePressScore()
    double score = 0.0;
    score += (state.fat_tail_score / 100.0) * W_PRESS_FAT;
    score += (state.smt_score / 15.0)       * W_PRESS_SMT;
-   if(state.quality == CLEAN)   score += W_PRESS_QUAL;
-   if(state.sweep_detected)     score += W_PRESS_SWEEP;
-   if(state.displacement_valid) score += W_PRESS_DISP;
-   if(state.no_trade_day)       score -= PRESS_NO_TRADE_DED;
+   if(state.quality == CLEAN)                       score += W_PRESS_QUAL;
+   if(state.sweep_detected)                         score += W_PRESS_SWEEP;
+   if(state.displacement_valid)                     score += W_PRESS_DISP;
+   if(state.volume_confirmed && Use_Volume)         score += W_PRESS_VOL;
+   if(state.no_trade_day)                           score -= PRESS_NO_TRADE_DED;
    state.press_score = ClampScore(score);
 }
 
@@ -677,6 +855,12 @@ void FinalDecision(datetime ny)
    state.decision        = "NO TRADE";
    state.direction       = DIR_NONE;
    state.risk_multiplier = 0.0;
+
+   if(state.archetype == ARCH_BALANCE)
+   {
+      state.decision = "BALANCE DAY";
+      return;
+   }
 
    if(state.no_trade_day)
    {
@@ -690,6 +874,8 @@ void FinalDecision(datetime ny)
 
    if(PastAssetCutoff(ny)) { state.decision = "CUTOFF"; return; }
 
+   if(!state.hierarchy_approved) { state.decision = "OPPOSING INDEX"; return; }
+
    if(!state.sweep_detected)     { state.decision = "WAIT SWEEP";        return; }
    if(!state.displacement_valid) { state.decision = "WAIT DISPLACEMENT"; return; }
 
@@ -702,16 +888,49 @@ void FinalDecision(datetime ny)
    else if(state.press_score >= 50.0) state.risk_multiplier = 1.0;
    else                               state.risk_multiplier = 0.5;
 
+   if(state.archetype == ARCH_PROBE)
+      state.risk_multiplier = MathMin(state.risk_multiplier, 1.0);
+
+   if(state.mitigation_touch >= 2)
+   {
+      state.risk_multiplier = MathMin(state.risk_multiplier, 1.0);
+      state.decision = "TRADE [2ND TOUCH]";
+      return;
+   }
+
+   if(state.mitigation_valid && state.computed_rr > 0.0 && state.computed_rr < Min_RR_Trade)
+   {
+      state.decision        = "LOW RR";
+      state.risk_multiplier = 0.0;
+      state.direction       = DIR_NONE;
+      return;
+   }
+
    state.decision = "TRADE";
 
-   if(state.press_score  >= PRESS_2R_THRESH &&
-      state.fat_tail_active                 &&
-      state.smt_confirmed                   &&
-      state.quality        == CLEAN         &&
-      state.mitigation_valid)
+   if(state.press_score    >= PRESS_2R_THRESH  &&
+      state.fat_tail_active                    &&
+      state.smt_confirmed                      &&
+      state.quality          == CLEAN          &&
+      state.mitigation_valid                   &&
+      state.mitigation_touch <= 1              &&
+      state.computed_rr      >= Min_RR_Press   &&
+      state.archetype        == ARCH_EXPANSION)
    {
       state.decision        = "PRESS 2R";
       state.risk_multiplier = 2.0;
+   }
+}
+
+//+------------------------------------------------------------------+
+string ArchetypeStr()
+{
+   switch(state.archetype)
+   {
+      case ARCH_EXPANSION: return "EXPANSION DAY";
+      case ARCH_PROBE:     return "PROBE DAY";
+      case ARCH_BALANCE:   return "BALANCE DAY";
+      default:             return "UNKNOWN";
    }
 }
 
@@ -737,17 +956,34 @@ void RenderDashboard(datetime ny)
       sweep_detail = "  DIR: " + (state.sweep_direction == DIR_BUY ? "BUY" : "SELL")
                    + "  [" + IntegerToString(g_sweep_persist) + " bars]";
 
-   string txt = "====== ELITE GRANDMASTER ENGINE v2.6 ======\n";
+   string mitig_touch_str = (state.mitigation_touch == 0) ? "NONE" :
+                            (state.mitigation_touch == 1) ? "1ST"  : "2ND+";
+
+   string rr_str     = (state.computed_rr > 0.0)
+                     ? DoubleToString(state.computed_rr, 2) + "R"
+                     : "N/A";
+   string target_str = (state.liquidity_target > 0.0)
+                     ? DoubleToString(state.liquidity_target, _Digits)
+                     : "N/A";
+
+   string txt = "====== ELITE GRANDMASTER ENGINE v3.0 ======\n";
    txt += "TIME:      " + TimeToString(ny, TIME_MINUTES) + "\n";
+   txt += "\nSESSION:   " + ArchetypeStr();
    txt += "\nPHASE:     " + EnumToString(state.phase);
    txt += "\nWINDOW:    " + window_str;
    txt += "\nQUALITY:   " + EnumToString(state.quality);
+   txt += "\nHIERARCHY: " + (state.hierarchy_approved ? "ALIGNED" : "OPPOSING");
    txt += "\n";
    txt += "\nSWEEP:     " + (string)state.sweep_detected + sweep_detail;
-   txt += "\nDISP:      " + (string)state.displacement_valid;
-   txt += "\nMITIG:     " + (string)state.mitigation_valid;
+   txt += "\nDISP:      " + (string)state.displacement_valid
+        + "  [VOL: " + (state.volume_confirmed ? "SPIKE" : "NORMAL") + "]";
+   txt += "\nMITIG:     " + (string)state.mitigation_valid
+        + "  [" + mitig_touch_str + "]";
    txt += "\nLEG WIN:   persist=" + IntegerToString(g_sweep_persist_bars)
         + "  leg=" + IntegerToString(g_leg_bars);
+   txt += "\n";
+   txt += "\nTARGET:    " + target_str;
+   txt += "\nRR:        " + rr_str;
    txt += "\n";
    txt += "\nSMT:       " + IntegerToString(state.smt_score)
         + "  [" + (state.smt_confirmed ? "CONFIRMED" : "WEAK") + "]";
